@@ -100,7 +100,7 @@ This uses the `build:` section already in `docker-compose.yml` to build for your
   
 ## Differences from the Mainline
 
-[![z.ai](https://assets.router-for.me/english-5.png)](https://z.ai/subscribe?ic=8JVLJQFSKB)
+[![z.ai](https://assets.router-for.me/english-5-0.jpg)](https://z.ai/subscribe?ic=8JVLJQFSKB)
 
 ## New Features (Plus Enhanced)
 
