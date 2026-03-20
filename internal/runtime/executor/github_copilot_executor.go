@@ -142,8 +142,6 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	if useResponses {
 		body = normalizeGitHubCopilotResponsesInput(body)
 		body = normalizeGitHubCopilotResponsesTools(body)
-		body, _ = sjson.DeleteBytes(body, "previous_response_id")
-		body = filterResponsesReasoningItems(body)
 	} else {
 		body = normalizeGitHubCopilotChatTools(body)
 	}
@@ -214,11 +212,6 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
-	// Stabilize encrypted IDs in non-streaming Responses API output.
-	if useResponses {
-		data = stabilizeResponsesNonStreamIDs(data)
-	}
-
 	detail := parseOpenAIUsage(data)
 	if useResponses && detail.TotalTokens == 0 {
 		detail = parseOpenAIResponsesUsage(data)
@@ -279,8 +272,6 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if useResponses {
 		body = normalizeGitHubCopilotResponsesInput(body)
 		body = normalizeGitHubCopilotResponsesTools(body)
-		body, _ = sjson.DeleteBytes(body, "previous_response_id")
-		body = filterResponsesReasoningItems(body)
 	} else {
 		body = normalizeGitHubCopilotChatTools(body)
 	}
@@ -363,20 +354,10 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, maxScannerBufferSize)
 		var param any
-		var idStabilizer *responsesIDStabilizer
-		if useResponses {
-			idStabilizer = newResponsesIDStabilizer()
-		}
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
-
-			// Stabilize rotating encrypted IDs from Copilot's Responses API
-			// before any translation or forwarding to the client.
-			if idStabilizer != nil {
-				line = idStabilizer.stabilize(line)
-			}
 
 			// Parse SSE data
 			if bytes.HasPrefix(line, dataTag) {
@@ -541,9 +522,9 @@ func detectLastConversationRole(body []byte) string {
 			}
 
 			switch item.Get("type").String() {
-			case "function_call", "function_call_arguments":
+			case "function_call", "function_call_arguments", "computer_call":
 				return "assistant"
-			case "function_call_output", "function_call_response", "tool_result":
+			case "function_call_output", "function_call_response", "tool_result", "computer_call_output":
 				return "tool"
 			}
 		}
@@ -580,14 +561,12 @@ func detectVisionContent(body []byte) bool {
 	return false
 }
 
-// normalizeModel ensures the model field in the request body matches the
-// resolved upstream model name (without thinking suffixes or alias prefixes).
-// GitHub Copilot's API requires the actual model name (e.g. "gpt-5.3-codex"),
-// not the client-facing alias (e.g. "copilot-gpt-5.3-codex").
+// normalizeModel strips the suffix (e.g. "(medium)") from the model name
+// before sending to GitHub Copilot, as the upstream API does not accept
+// suffixed model identifiers.
 func (e *GitHubCopilotExecutor) normalizeModel(model string, body []byte) []byte {
 	baseModel := thinking.ParseSuffix(model).ModelName
-	bodyModel := gjson.GetBytes(body, "model").String()
-	if baseModel != bodyModel {
+	if baseModel != model {
 		body, _ = sjson.SetBytes(body, "model", baseModel)
 	}
 	return body
@@ -674,6 +653,7 @@ func normalizeGitHubCopilotChatTools(body []byte) []byte {
 }
 
 func normalizeGitHubCopilotResponsesInput(body []byte) []byte {
+	body = stripGitHubCopilotResponsesUnsupportedFields(body)
 	input := gjson.GetBytes(body, "input")
 	if input.Exists() {
 		// If input is already a string or array, keep it as-is.
@@ -846,181 +826,9 @@ func normalizeGitHubCopilotResponsesInput(body []byte) []byte {
 	return body
 }
 
-// stabilizeResponsesStreamIDs replaces the rotating encrypted IDs in Copilot's
-// Responses API streaming events with stable synthetic IDs. Copilot returns a
-// different encrypted ID for the same logical item on every SSE event, which
-// breaks clients (like @ai-sdk/openai) that track streaming parts by item_id.
-// This function maps each (output_index, content_index) pair to a stable ID
-// and rewrites all id/item_id fields consistently.
-type responsesIDStabilizer struct {
-	// responseID is the stable response-level ID.
-	responseID string
-	// itemIDs maps output_index to a stable item ID.
-	itemIDs map[int64]string
-	// counter for generating unique IDs.
-	counter int64
-}
-
-func newResponsesIDStabilizer() *responsesIDStabilizer {
-	return &responsesIDStabilizer{
-		itemIDs: make(map[int64]string),
-	}
-}
-
-func (s *responsesIDStabilizer) nextID(prefix string) string {
-	s.counter++
-	return fmt.Sprintf("%s_%d", prefix, s.counter)
-}
-
-func (s *responsesIDStabilizer) stabilize(line []byte) []byte {
-	if !bytes.HasPrefix(line, dataTag) {
-		return line
-	}
-	data := bytes.TrimSpace(line[5:])
-	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
-		return line
-	}
-
-	eventType := gjson.GetBytes(data, "type").String()
-	changed := false
-
-	switch eventType {
-	case "response.created", "response.in_progress", "response.completed":
-		// Stabilize the top-level response ID.
-		if s.responseID == "" {
-			s.responseID = s.nextID("resp")
-		}
-		data, _ = sjson.SetBytes(data, "response.id", s.responseID)
-		// Also stabilize output item IDs inside response.completed
-		if eventType == "response.completed" {
-			output := gjson.GetBytes(data, "response.output")
-			if output.Exists() && output.IsArray() {
-				for i, item := range output.Array() {
-					idx := int64(i)
-					stableID, ok := s.itemIDs[idx]
-					if !ok {
-						stableID = s.nextID("item")
-						s.itemIDs[idx] = stableID
-					}
-					path := fmt.Sprintf("response.output.%d.id", i)
-					data, _ = sjson.SetBytes(data, path, stableID)
-					_ = item // suppress unused
-				}
-			}
-		}
-		changed = true
-
-	case "response.output_item.added", "response.output_item.done":
-		if s.responseID == "" {
-			s.responseID = s.nextID("resp")
-		}
-		outputIdx := gjson.GetBytes(data, "output_index").Int()
-		stableID, ok := s.itemIDs[outputIdx]
-		if !ok {
-			stableID = s.nextID("item")
-			s.itemIDs[outputIdx] = stableID
-		}
-		data, _ = sjson.SetBytes(data, "item.id", stableID)
-		changed = true
-
-	case "response.content_part.added", "response.content_part.done":
-		outputIdx := gjson.GetBytes(data, "output_index").Int()
-		stableID, ok := s.itemIDs[outputIdx]
-		if !ok {
-			stableID = s.nextID("item")
-			s.itemIDs[outputIdx] = stableID
-		}
-		data, _ = sjson.SetBytes(data, "item_id", stableID)
-		changed = true
-
-	case "response.output_text.delta", "response.output_text.done":
-		outputIdx := gjson.GetBytes(data, "output_index").Int()
-		stableID, ok := s.itemIDs[outputIdx]
-		if !ok {
-			stableID = s.nextID("item")
-			s.itemIDs[outputIdx] = stableID
-		}
-		data, _ = sjson.SetBytes(data, "item_id", stableID)
-		changed = true
-
-	case "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
-		outputIdx := gjson.GetBytes(data, "output_index").Int()
-		stableID, ok := s.itemIDs[outputIdx]
-		if !ok {
-			stableID = s.nextID("item")
-			s.itemIDs[outputIdx] = stableID
-		}
-		data, _ = sjson.SetBytes(data, "item_id", stableID)
-		changed = true
-
-	case "response.function_call_arguments.delta", "response.function_call_arguments.done":
-		outputIdx := gjson.GetBytes(data, "output_index").Int()
-		stableID, ok := s.itemIDs[outputIdx]
-		if !ok {
-			stableID = s.nextID("item")
-			s.itemIDs[outputIdx] = stableID
-		}
-		data, _ = sjson.SetBytes(data, "item_id", stableID)
-		changed = true
-	}
-
-	if !changed {
-		return line
-	}
-	return append([]byte("data: "), data...)
-}
-
-// stabilizeResponsesNonStreamIDs replaces encrypted IDs in a non-streaming
-// Responses API JSON body with stable synthetic IDs.
-func stabilizeResponsesNonStreamIDs(data []byte) []byte {
-	counter := 0
-	nextID := func(prefix string) string {
-		counter++
-		return fmt.Sprintf("%s_%d", prefix, counter)
-	}
-
-	// Stabilize response ID
-	if gjson.GetBytes(data, "id").Exists() {
-		data, _ = sjson.SetBytes(data, "id", nextID("resp"))
-	}
-
-	// Stabilize output item IDs
-	output := gjson.GetBytes(data, "output")
-	if output.Exists() && output.IsArray() {
-		for i := range output.Array() {
-			path := fmt.Sprintf("output.%d.id", i)
-			if gjson.GetBytes(data, path).Exists() {
-				data, _ = sjson.SetBytes(data, path, nextID("item"))
-			}
-		}
-	}
-
-	return data
-}
-
-// filterResponsesReasoningItems removes reasoning items from the input array.
-// The Copilot API returns store=false, so reasoning item IDs from previous
-// responses cannot be referenced. OpenCode sends these back in follow-up
-// requests, causing "item not found" errors.
-func filterResponsesReasoningItems(body []byte) []byte {
-	input := gjson.GetBytes(body, "input")
-	if !input.Exists() || !input.IsArray() {
-		return body
-	}
-	filtered := "[]"
-	changed := false
-	for _, item := range input.Array() {
-		if item.Get("type").String() == "reasoning" {
-			changed = true
-			continue
-		}
-		filtered, _ = sjson.SetRaw(filtered, "-1", item.Raw)
-	}
-	if !changed {
-		return body
-	}
-	body, _ = sjson.SetRawBytes(body, "input", []byte(filtered))
+func stripGitHubCopilotResponsesUnsupportedFields(body []byte) []byte {
+	// GitHub Copilot /responses rejects service_tier, so always remove it.
+	body, _ = sjson.DeleteBytes(body, "service_tier")
 	return body
 }
 
@@ -1031,6 +839,10 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 		if tools.IsArray() {
 			for _, tool := range tools.Array() {
 				toolType := tool.Get("type").String()
+				if isGitHubCopilotResponsesBuiltinTool(toolType) {
+					filtered, _ = sjson.SetRaw(filtered, "-1", tool.Raw)
+					continue
+				}
 				// Accept OpenAI format (type="function") and Claude format
 				// (no type field, but has top-level name + input_schema).
 				if toolType != "" && toolType != "function" {
@@ -1078,6 +890,10 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	}
 	if toolChoice.Type == gjson.JSON {
 		choiceType := toolChoice.Get("type").String()
+		if isGitHubCopilotResponsesBuiltinTool(choiceType) {
+			body, _ = sjson.SetRawBytes(body, "tool_choice", []byte(toolChoice.Raw))
+			return body
+		}
 		if choiceType == "function" {
 			name := toolChoice.Get("name").String()
 			if name == "" {
@@ -1093,6 +909,15 @@ func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	}
 	body, _ = sjson.SetBytes(body, "tool_choice", "auto")
 	return body
+}
+
+func isGitHubCopilotResponsesBuiltinTool(toolType string) bool {
+	switch strings.TrimSpace(toolType) {
+	case "computer", "computer_use_preview":
+		return true
+	default:
+		return false
+	}
 }
 
 func collectTextFromNode(node gjson.Result) string {
