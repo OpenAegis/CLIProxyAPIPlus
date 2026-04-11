@@ -18,8 +18,9 @@
 #    the account's usage pattern look like a normal VS Code user who happens
 #    to use agent mode frequently.
 #
---- a/internal/runtime/executor/github_copilot_executor.go	2026-03-20 04:38:12.671610149 +0000
-+++ b/internal/runtime/executor/github_copilot_executor.go	2026-03-20 04:39:19.647878275 +0000
+diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/runtime/executor/github_copilot_executor.go
+--- a/internal/runtime/executor/github_copilot_executor.go
++++ b/internal/runtime/executor/github_copilot_executor.go
 @@ -4,8 +4,11 @@
  	"bufio"
  	"bytes"
@@ -30,9 +31,9 @@
  	"io"
 +	"math/rand"
  	"net/http"
+ 	"slices"
  	"strings"
- 	"sync"
-@@ -44,8 +47,71 @@
+@@ -46,8 +49,87 @@
  	copilotIntegrationID = "vscode-chat"
  	copilotOpenAIIntent  = "conversation-edits"
  	copilotGitHubAPIVer  = "2025-10-01"
@@ -84,8 +85,8 @@
 +	raw := fmt.Sprintf("%s:%d", apiToken, bucket)
 +	h := sha256.Sum256([]byte(raw))
 +	// Format as UUID-like string to match real VS Code session IDs
-+	hex := hex.EncodeToString(h[:16])
-+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex[0:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
++	hexStr := hex.EncodeToString(h[:16])
++	return fmt.Sprintf("%s-%s-%s-%s-%s", hexStr[0:8], hexStr[8:12], hexStr[12:16], hexStr[16:20], hexStr[20:32])
 +}
 +
 +// copilotPickIndex deterministically selects an index from a pool based on the token hash.
@@ -101,10 +102,26 @@
 +	return rand.Float64() < copilotAgentRatio
 +}
 +
++// detectLastConversationRole returns the role of the last message in the conversation.
++func detectLastConversationRole(body []byte) string {
++	if len(body) == 0 {
++		return ""
++	}
++	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
++		arr := messages.Array()
++		for i := len(arr) - 1; i >= 0; i-- {
++			if r := arr[i].Get("role").String(); r != "" {
++				return r
++			}
++		}
++	}
++	return ""
++}
++
  // GitHubCopilotExecutor handles requests to the GitHub Copilot API.
  type GitHubCopilotExecutor struct {
  	cfg   *config.Config
-@@ -516,22 +582,47 @@
+@@ -555,20 +637,47 @@
  }
  
  // applyHeaders sets the required headers for GitHub Copilot API requests.
@@ -133,11 +150,10 @@
  	r.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
  	r.Header.Set("X-Github-Api-Version", copilotGitHubAPIVer)
  	r.Header.Set("X-Request-Id", uuid.NewString())
- 
--	// Always set X-Initiator to "agent" for unlimited premium request access.
 -	r.Header.Set("X-Initiator", "agent")
 -	r.Header.Set("VScode-SessionId", uuid.NewString())
 -	r.Header.Set("VScode-MachineId", uuid.NewString())
++
 +	// Mix agent/user initiator to blend with normal VS Code traffic.
 +	// Most requests use "agent" for unlimited premium access; a fraction
 +	// use the real dynamic value to look like normal usage.

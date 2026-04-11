@@ -21,7 +21,7 @@
 diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_response.go b/internal/translator/claude/openai/chat-completions/claude_openai_response.go
 --- a/internal/translator/claude/openai/chat-completions/claude_openai_response.go
 +++ b/internal/translator/claude/openai/chat-completions/claude_openai_response.go
-@@ -113,7 +113,7 @@
+@@ -125,7 +125,7 @@
  			blockType := contentBlock.Get("type").String()
  
  			if blockType == "tool_use" {
@@ -30,23 +30,23 @@ diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_re
  				toolCallID := contentBlock.Get("id").String()
  				toolName := contentBlock.Get("name").String()
  				index := int(root.Get("index").Int())
-@@ -127,8 +127,13 @@
+@@ -139,8 +139,13 @@
  					Name: toolName,
  				}
  
 -				// Don't output anything yet - wait for complete tool call
--				return []string{}
+-				return [][]byte{}
 +				// Emit the tool call header so clients can show progress immediately
-+				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.index", index)
-+				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.id", toolCallID)
-+				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.type", "function")
-+				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.function.name", toolName)
-+				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.function.arguments", "")
-+				return []string{template}
++				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.index", index)
++				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.id", toolCallID)
++				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.type", "function")
++				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.name", toolName)
++				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.arguments", "")
++				return [][]byte{template}
  			}
  		}
- 		return []string{}
-@@ -153,16 +158,13 @@
+ 		return [][]byte{}
+@@ -165,16 +170,13 @@
  					hasContent = true
  				}
  			case "input_json_delta":
@@ -59,15 +59,15 @@ diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_re
 -							accumulator.Arguments.WriteString(partialJSON.String())
 -						}
 -					}
-+					template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.index", index)
-+					template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.function.arguments", partialJSON.String())
-+					return []string{template}
++					template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.index", index)
++					template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.arguments", partialJSON.String())
++					return [][]byte{template}
  				}
 -				// Don't output anything yet - wait for complete tool call
- 				return []string{}
+ 				return [][]byte{}
  			}
  		}
-@@ -173,26 +175,10 @@
+@@ -185,26 +187,10 @@
  		}
  
  	case "content_block_stop":
@@ -81,18 +81,18 @@ diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_re
 -				if arguments == "" {
 -					arguments = "{}"
 -				}
--				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.index", index)
--				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.id", accumulator.ID)
--				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.type", "function")
--				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.function.name", accumulator.Name)
--				template, _ = sjson.Set(template, "choices.0.delta.tool_calls.0.function.arguments", arguments)
+-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.index", index)
+-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.id", accumulator.ID)
+-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.type", "function")
+-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.name", accumulator.Name)
+-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.arguments", arguments)
 -
 -				// Clean up the accumulator for this index
 -				delete((*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator, index)
 -
--				return []string{template}
+-				return [][]byte{template}
 -			}
 +			delete((*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator, index)
  		}
- 		return []string{}
+ 		return [][]byte{}
  

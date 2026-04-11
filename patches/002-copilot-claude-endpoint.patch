@@ -2,15 +2,47 @@
 #
 # Routes Claude models (opus-4, sonnet-4, etc.) to /v1/messages endpoint
 # with Claude-native format. Enables thinking/reasoning with sensible defaults.
-# Routes GPT-5.3 models to /responses endpoint. Strips copilot- prefix from
-# model names in registry lookups, provider resolution, and upstream requests.
+# Routes GPT-5 models to /responses endpoint via codex format. Strips copilot- prefix
+# from model names in registry lookups, provider resolution, and upstream requests.
 # Adds SSE passthrough for Claude streaming, usage fallback, and
 # convertPlainClaudeResponseToOpenAI for non-streaming responses.
 # Stabilizes rotating encrypted IDs in Responses API events.
 #
---- a/internal/runtime/executor/github_copilot_executor.go	2026-03-20 04:44:43.549174950 +0000
-+++ b/internal/runtime/executor/github_copilot_executor.go	2026-03-20 04:48:55.286178993 +0000
-@@ -28,6 +28,7 @@
+diff --git a/internal/runtime/executor/compat_helpers.go b/internal/runtime/executor/compat_helpers.go
+index 2d437d9b..149b101d 100644
+--- a/internal/runtime/executor/compat_helpers.go
++++ b/internal/runtime/executor/compat_helpers.go
+@@ -34,6 +34,14 @@ func parseOpenAIResponsesStreamUsage(line []byte) (usage.Detail, bool) {
+ 	return helps.ParseOpenAIStreamUsage(line)
+ }
+ 
++func parseClaudeUsage(data []byte) usage.Detail {
++	return helps.ParseClaudeUsage(data)
++}
++
++func parseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
++	return helps.ParseClaudeStreamUsage(line)
++}
++
+ func getTokenizer(model string) (tokenizer.Codec, error) {
+ 	return helps.TokenizerForModel(model)
+ }
+diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/runtime/executor/github_copilot_executor.go
+index 8f0f90d4..68d67641 100644
+--- a/internal/runtime/executor/github_copilot_executor.go
++++ b/internal/runtime/executor/github_copilot_executor.go
+@@ -16,9 +16,9 @@ import (
+ 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+ 	log "github.com/sirupsen/logrus"
+@@ -30,6 +30,7 @@ const (
  	githubCopilotBaseURL       = "https://api.githubcopilot.com"
  	githubCopilotChatPath      = "/chat/completions"
  	githubCopilotResponsesPath = "/responses"
@@ -18,7 +50,7 @@
  	githubCopilotAuthType      = "github-copilot"
  	githubCopilotTokenCacheTTL = 25 * time.Minute
  	// tokenExpiryBuffer is the time before expiry when we should refresh the token.
-@@ -36,14 +37,13 @@
+@@ -38,13 +39,13 @@ const (
  	maxScannerBufferSize = 20_971_520
  
  	// Copilot API header values.
@@ -29,12 +61,11 @@
  	copilotIntegrationID = "vscode-chat"
  	copilotOpenAIIntent  = "conversation-edits"
  	copilotGitHubAPIVer  = "2025-10-01"
--	// Additional headers for unlimited premium requests
 -	copilotThinkingBeta  = "interleaved-thinking-2025-05-14,context-management-2025-06-27"
  )
  
  // GitHubCopilotExecutor handles requests to the GitHub Copilot API.
-@@ -84,7 +84,7 @@
+@@ -85,7 +86,7 @@ func (e *GitHubCopilotExecutor) PrepareRequest(req *http.Request, auth *cliproxy
  	if errToken != nil {
  		return errToken
  	}
@@ -43,7 +74,7 @@
  	return nil
  }
  
-@@ -115,11 +115,14 @@
+@@ -116,11 +117,14 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
  	defer reporter.trackFailure(ctx, &err)
  
  	from := opts.SourceFormat
@@ -51,18 +82,19 @@
 -	to := sdktranslator.FromString("openai")
 -	if useResponses {
 -		to = sdktranslator.FromString("openai-response")
+-	}
 +	useClaude := isCopilotClaudeModel(req.Model)
 +	toFormat := "openai"
 +	if useClaude {
 +		toFormat = "claude"
 +	} else if isGPT5Model(req.Model) {
 +		toFormat = "codex"
- 	}
++	}
 +	to := sdktranslator.FromString(toFormat)
  	originalPayload := bytes.Clone(req.Payload)
  	if len(opts.OriginalRequest) > 0 {
  		originalPayload = bytes.Clone(opts.OriginalRequest)
-@@ -127,43 +130,47 @@
+@@ -128,45 +132,49 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
  	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, false)
  	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
  	body = e.normalizeModel(req.Model, body)
@@ -70,6 +102,7 @@
 +	if !useClaude {
 +		body = flattenAssistantContent(body)
 +	}
+ 	body = stripUnsupportedBetas(body)
  
  	// Detect vision content before input normalization removes messages
  	hasVision := detectVisionContent(body)
@@ -96,6 +129,7 @@
 +	if isGPT5Model(req.Model) {
  		body = normalizeGitHubCopilotResponsesInput(body)
  		body = normalizeGitHubCopilotResponsesTools(body)
+ 		body = applyGitHubCopilotResponsesDefaults(body)
 -	} else {
 +	} else if !useClaude {
  		body = normalizeGitHubCopilotChatTools(body)
@@ -127,7 +161,7 @@
  		httpReq.Header.Set("Copilot-Vision-Request", "true")
  	}
  
-@@ -214,21 +221,21 @@
+@@ -217,22 +225,22 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
  	}
  	appendAPIResponseChunk(ctx, e.cfg, data)
  
@@ -147,17 +181,19 @@
  	}
  
  	var param any
--	converted := ""
+-	var converted []byte
 -	if useResponses && from.String() == "claude" {
 -		converted = translateGitHubCopilotResponsesNonStreamToClaude(data)
 -	} else {
+-		data = normalizeGitHubCopilotReasoningField(data)
 -		converted = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, data, &param)
 -	}
++	data = normalizeGitHubCopilotReasoningField(data)
 +	converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, data, &param)
- 	resp = cliproxyexecutor.Response{Payload: []byte(converted)}
+ 	resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
  	reporter.ensurePublished(ctx)
  	return resp, nil
-@@ -245,11 +252,14 @@
+@@ -249,11 +257,14 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
  	defer reporter.trackFailure(ctx, &err)
  
  	from := opts.SourceFormat
@@ -165,18 +201,19 @@
 -	to := sdktranslator.FromString("openai")
 -	if useResponses {
 -		to = sdktranslator.FromString("openai-response")
+-	}
 +	useClaude := isCopilotClaudeModel(req.Model)
 +	toFormat := "openai"
 +	if useClaude {
 +		toFormat = "claude"
 +	} else if isGPT5Model(req.Model) {
 +		toFormat = "codex"
- 	}
++	}
 +	to := sdktranslator.FromString(toFormat)
  	originalPayload := bytes.Clone(req.Payload)
  	if len(opts.OriginalRequest) > 0 {
  		originalPayload = bytes.Clone(opts.OriginalRequest)
-@@ -257,47 +267,52 @@
+@@ -261,49 +272,54 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
  	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, false)
  	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
  	body = e.normalizeModel(req.Model, body)
@@ -184,6 +221,7 @@
 +	if !useClaude {
 +		body = flattenAssistantContent(body)
 +	}
+ 	body = stripUnsupportedBetas(body)
  
  	// Detect vision content before input normalization removes messages
  	hasVision := detectVisionContent(body)
@@ -210,6 +248,7 @@
  	if useResponses {
  		body = normalizeGitHubCopilotResponsesInput(body)
  		body = normalizeGitHubCopilotResponsesTools(body)
+ 		body = applyGitHubCopilotResponsesDefaults(body)
 -	} else {
 +	} else if !useClaude {
  		body = normalizeGitHubCopilotChatTools(body)
@@ -247,7 +286,7 @@
  		httpReq.Header.Set("Copilot-Vision-Request", "true")
  	}
  
-@@ -356,6 +371,11 @@
+@@ -362,6 +378,11 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
  		scanner := bufio.NewScanner(httpResp.Body)
  		scanner.Buffer(nil, maxScannerBufferSize)
  		var param any
@@ -259,7 +298,7 @@
  
  		for scanner.Scan() {
  			line := scanner.Bytes()
-@@ -368,20 +388,36 @@
+@@ -374,16 +395,27 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
  					continue
  				}
  				if detail, ok := parseOpenAIStreamUsage(line); ok {
@@ -285,22 +324,25 @@
 +				line = idStabilizer.stabilize(line)
 +			}
 +
- 			var chunks []string
+ 			var chunks [][]byte
 -			if useResponses && from.String() == "claude" {
 +			if !useClaude && useResponses && from.String() == "claude" {
  				chunks = translateGitHubCopilotResponsesStreamToClaude(bytes.Clone(line), &param)
  			} else {
- 				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
+ 				// Strip SSE "data: " prefix before reasoning field normalization,
+@@ -401,6 +433,11 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
+ 				}
+ 				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, normalizedLine, &param)
  			}
 +			if ssePassthrough {
 +				for i := range chunks {
-+					chunks[i] = chunks[i] + "\n"
++					chunks[i] = append(chunks[i], '\n')
 +				}
 +			}
  			for i := range chunks {
- 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+ 				out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(chunks[i])}
  			}
-@@ -480,7 +516,7 @@
+@@ -518,7 +555,7 @@ func (e *GitHubCopilotExecutor) ensureAPIToken(ctx context.Context, auth *clipro
  }
  
  // applyHeaders sets the required headers for GitHub Copilot API requests.
@@ -309,7 +351,7 @@
  	r.Header.Set("Content-Type", "application/json")
  	r.Header.Set("Authorization", "Bearer "+apiToken)
  	r.Header.Set("Accept", "application/json")
-@@ -496,6 +532,9 @@
+@@ -532,6 +569,9 @@ func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string, b
  	r.Header.Set("X-Initiator", "agent")
  	r.Header.Set("VScode-SessionId", uuid.NewString())
  	r.Header.Set("VScode-MachineId", uuid.NewString())
@@ -318,8 +360,8 @@
 +	}
  }
  
- func detectLastConversationRole(body []byte) string {
-@@ -562,23 +601,83 @@
+ // isAgentInitiated determines whether the current request is agent-initiated
+@@ -679,13 +719,14 @@ func detectVisionContent(body []byte) bool {
  	return false
  }
  
@@ -340,10 +382,10 @@
  	}
  	return body
  }
+@@ -769,6 +810,73 @@ func normalizeGitHubCopilotReasoningField(data []byte) []byte {
+ 	return data
+ }
  
--func useGitHubCopilotResponsesEndpoint(sourceFormat sdktranslator.Format, model string) bool {
--	if sourceFormat.String() == "openai-response" {
--		return true
 +func isGPT5Model(model string) bool {
 +	normalized := strings.TrimPrefix(model, "copilot-")
 +	return strings.HasPrefix(normalized, "gpt-5")
@@ -357,9 +399,7 @@
 +func getEndpointPath(model string, format sdktranslator.Format) string {
 +	if isCopilotClaudeFormat(format) {
 +		return githubCopilotMessagesPath
- 	}
--	baseModel := strings.ToLower(thinking.ParseSuffix(model).ModelName)
--	return strings.Contains(baseModel, "codex")
++	}
 +	if isGPT5Model(model) {
 +		return githubCopilotResponsesPath
 +	}
@@ -411,10 +451,12 @@
 +	body, _ = sjson.SetBytes(body, "thinking.type", "enabled")
 +	body, _ = sjson.SetBytes(body, "thinking.budget_tokens", budgetVal)
 +	return body
- }
- 
- // flattenAssistantContent converts assistant message content from array format
-@@ -827,6 +926,146 @@
++}
++
+ func useGitHubCopilotResponsesEndpoint(sourceFormat sdktranslator.Format, model string) bool {
+ 	if sourceFormat.String() == "openai-response" {
+ 		return true
+@@ -1042,6 +1150,146 @@ func normalizeGitHubCopilotResponsesInput(body []byte) []byte {
  	return body
  }
  
@@ -561,9 +603,19 @@
  func stripGitHubCopilotResponsesUnsupportedFields(body []byte) []byte {
  	// GitHub Copilot /responses rejects service_tier, so always remove it.
  	body, _ = sjson.DeleteBytes(body, "service_tier")
---- a/internal/runtime/executor/github_copilot_executor_test.go	2026-03-20 04:44:43.549174950 +0000
-+++ b/internal/runtime/executor/github_copilot_executor_test.go	2026-03-20 04:50:11.266481704 +0000
-@@ -56,24 +56,29 @@
+diff --git a/internal/runtime/executor/github_copilot_executor_test.go b/internal/runtime/executor/github_copilot_executor_test.go
+index 774a3cae..62115ad5 100644
+--- a/internal/runtime/executor/github_copilot_executor_test.go
++++ b/internal/runtime/executor/github_copilot_executor_test.go
+@@ -7,7 +7,6 @@ import (
+ 	"testing"
+ 
+ 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+ 	"github.com/tidwall/gjson"
+@@ -60,60 +59,29 @@ func TestGitHubCopilotNormalizeModel_StripsSuffix(t *testing.T) {
  	}
  }
  
@@ -581,31 +633,65 @@
 -	t.Parallel()
 -	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5-codex") {
 -		t.Fatal("expected codex model to use /responses")
+-	}
+-}
+-
+-func TestUseGitHubCopilotResponsesEndpoint_RegistryResponsesOnlyModel(t *testing.T) {
+-	// Not parallel: shares global model registry with DynamicRegistryWinsOverStatic.
+-	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4") {
+-		t.Fatal("expected responses-only registry model to use /responses")
 +	if !isGPT5Model("copilot-gpt-5-codex") {
 +		t.Fatal("expected copilot-gpt-5-codex to be GPT5 model")
-+	}
+ 	}
+-	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4-mini") {
+-		t.Fatal("expected responses-only registry model to use /responses")
 +	if isGPT5Model("claude-3-5-sonnet") {
 +		t.Fatal("expected claude model not to be GPT5")
  	}
  }
  
--func TestUseGitHubCopilotResponsesEndpoint_DefaultChat(t *testing.T) {
+-func TestUseGitHubCopilotResponsesEndpoint_DynamicRegistryWinsOverStatic(t *testing.T) {
+-	// Not parallel: mutates global model registry, conflicts with RegistryResponsesOnlyModel.
+-
+-	reg := registry.GetGlobalRegistry()
+-	clientID := "github-copilot-test-client"
+-	reg.RegisterClient(clientID, "github-copilot", []*registry.ModelInfo{
+-		{
+-			ID:                 "gpt-5.4",
+-			SupportedEndpoints: []string{"/chat/completions", "/responses"},
+-		},
+-		{
+-			ID:                 "gpt-5.4-mini",
+-			SupportedEndpoints: []string{"/chat/completions", "/responses"},
+-		},
+-	})
+-	defer reg.UnregisterClient(clientID)
+-
+-	if useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4") {
+-		t.Fatal("expected dynamic registry definition to take precedence over static fallback")
 +func TestIsCopilotClaudeModel(t *testing.T) {
- 	t.Parallel()
--	if useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "claude-3-5-sonnet") {
--		t.Fatal("expected default openai source with non-codex model to use /chat/completions")
++	t.Parallel()
 +	if !isCopilotClaudeModel("claude-3-5-sonnet") {
 +		t.Fatal("expected claude-3-5-sonnet to be Claude model")
-+	}
+ 	}
+-
+-	if useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4-mini") {
+-		t.Fatal("expected dynamic registry definition to take precedence over static fallback")
 +	if !isCopilotClaudeModel("copilot-claude-sonnet-4") {
 +		t.Fatal("expected copilot-claude-sonnet-4 to be Claude model")
-+	}
+ 	}
+-}
+-
+-func TestUseGitHubCopilotResponsesEndpoint_DefaultChat(t *testing.T) {
+-	t.Parallel()
+-	if useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "claude-3-5-sonnet") {
+-		t.Fatal("expected default openai source with non-codex model to use /chat/completions")
 +	if isCopilotClaudeModel("gpt-5-codex") {
 +		t.Fatal("expected gpt-5 not to be Claude model")
  	}
  }
  
-@@ -269,9 +274,9 @@
+@@ -315,9 +283,9 @@ func TestApplyHeaders_XInitiator_UserOnly(t *testing.T) {
  	e := &GitHubCopilotExecutor{}
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
  	body := []byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"}]}`)
@@ -618,32 +704,37 @@
  	}
  }
  
-@@ -279,11 +284,11 @@
+@@ -325,13 +293,11 @@ func TestApplyHeaders_XInitiator_AgentWhenLastUserButHistoryHasAssistant(t *test
  	t.Parallel()
  	e := &GitHubCopilotExecutor{}
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
--	// Last role governs the initiator decision.
-+	// Claude Code typical flow: last message is user (tool result), but has assistant in history
- 	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"I will read the file"},{"role":"user","content":"tool result here"}]}`)
+-	// When the last role is "user" and the message contains tool_result content,
+-	// the request is a continuation (e.g. Claude tool result translated to a
+-	// synthetic user message). Should be "agent".
+-	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"I will read the file"},{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"file contents..."}]}]}`)
 -	e.applyHeaders(req, "token", body)
--	if got := req.Header.Get("X-Initiator"); got != "user" {
--		t.Fatalf("X-Initiator = %q, want user (last role is user)", got)
++	// Claude Code typical flow: last message is user (tool result), but has assistant in history
++	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"I will read the file"},{"role":"user","content":"tool result here"}]}`)
 +	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, body)
-+	if got := req.Header.Get("X-Initiator"); got != "agent" {
+ 	if got := req.Header.Get("X-Initiator"); got != "agent" {
+-		t.Fatalf("X-Initiator = %q, want agent (last user contains tool_result)", got)
 +		t.Fatalf("X-Initiator = %q, want agent (assistant exists in messages)", got)
  	}
  }
  
-@@ -292,7 +297,7 @@
- 	e := &GitHubCopilotExecutor{}
+@@ -341,9 +307,9 @@ func TestApplyHeaders_XInitiator_AgentWithToolRole(t *testing.T) {
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+ 	// When the last message has role "tool", it's clearly agent-initiated.
  	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"tool","content":"result"}]}`)
 -	e.applyHeaders(req, "token", body)
 +	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, body)
  	if got := req.Header.Get("X-Initiator"); got != "agent" {
- 		t.Fatalf("X-Initiator = %q, want agent (tool role exists)", got)
+-		t.Fatalf("X-Initiator = %q, want agent (last role is tool)", got)
++		t.Fatalf("X-Initiator = %q, want agent (tool role exists)", got)
  	}
-@@ -303,7 +308,7 @@
+ }
+ 
+@@ -352,7 +318,7 @@ func TestApplyHeaders_XInitiator_InputArrayLastAssistantMessage(t *testing.T) {
  	e := &GitHubCopilotExecutor{}
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
  	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}`)
@@ -652,20 +743,19 @@
  	if got := req.Header.Get("X-Initiator"); got != "agent" {
  		t.Fatalf("X-Initiator = %q, want agent (last role is assistant)", got)
  	}
-@@ -314,9 +319,9 @@
- 	e := &GitHubCopilotExecutor{}
+@@ -364,9 +330,9 @@ func TestApplyHeaders_XInitiator_InputArrayAgentWhenLastUserButHistoryHasAssista
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+ 	// Responses API: last item is user-role but history contains assistant → agent.
  	body := []byte(`{"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I can help"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Do X"}]}]}`)
 -	e.applyHeaders(req, "token", body)
--	if got := req.Header.Get("X-Initiator"); got != "user" {
--		t.Fatalf("X-Initiator = %q, want user (last role is user)", got)
 +	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, body)
-+	if got := req.Header.Get("X-Initiator"); got != "agent" {
+ 	if got := req.Header.Get("X-Initiator"); got != "agent" {
+-		t.Fatalf("X-Initiator = %q, want agent (history has assistant)", got)
 +		t.Fatalf("X-Initiator = %q, want agent (last role is user)", got)
  	}
  }
  
-@@ -325,7 +330,7 @@
+@@ -375,7 +341,7 @@ func TestApplyHeaders_XInitiator_InputArrayLastFunctionCallOutput(t *testing.T)
  	e := &GitHubCopilotExecutor{}
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
  	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Use tool"}]},{"type":"function_call","call_id":"c1","name":"Read","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
@@ -674,7 +764,40 @@
  	if got := req.Header.Get("X-Initiator"); got != "agent" {
  		t.Fatalf("X-Initiator = %q, want agent (last item maps to tool role)", got)
  	}
-@@ -337,9 +342,9 @@
+@@ -386,11 +352,11 @@ func TestApplyHeaders_XInitiator_UserInMultiTurnNoTools(t *testing.T) {
+ 	e := &GitHubCopilotExecutor{}
+ 	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+ 	// Genuine multi-turn: user → assistant (plain text) → user follow-up.
+-	// No tool messages → should be "user" (not a false-positive).
++	// Patch 001 forces X-Initiator to "agent" unconditionally.
+ 	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"Hi there!"},{"role":"user","content":"what is 2+2?"}]}`)
+-	e.applyHeaders(req, "token", body)
+-	if got := req.Header.Get("X-Initiator"); got != "user" {
+-		t.Fatalf("X-Initiator = %q, want user (genuine multi-turn, no tools)", got)
++	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, body)
++	if got := req.Header.Get("X-Initiator"); got != "agent" {
++		t.Fatalf("X-Initiator = %q, want agent", got)
+ 	}
+ }
+ 
+@@ -399,12 +365,11 @@ func TestApplyHeaders_XInitiator_UserFollowUpAfterToolHistory(t *testing.T) {
+ 	e := &GitHubCopilotExecutor{}
+ 	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+ 	// User follow-up after a completed tool-use conversation.
+-	// The last message is a genuine user question — should be "user", not "agent".
+-	// This aligns with opencode's behavior: only active tool loops are agent-initiated.
++	// Patch 001 forces X-Initiator to "agent" unconditionally.
+ 	body := []byte(`{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Read","input":{}}]},{"role":"tool","tool_call_id":"tu1","content":"file data"},{"role":"assistant","content":"I read the file."},{"role":"user","content":"What did we do so far?"}]}`)
+-	e.applyHeaders(req, "token", body)
+-	if got := req.Header.Get("X-Initiator"); got != "user" {
+-		t.Fatalf("X-Initiator = %q, want user (genuine follow-up after tool history)", got)
++	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, body)
++	if got := req.Header.Get("X-Initiator"); got != "agent" {
++		t.Fatalf("X-Initiator = %q, want agent", got)
+ 	}
+ }
+ 
+@@ -414,9 +379,9 @@ func TestApplyHeaders_GitHubAPIVersion(t *testing.T) {
  	t.Parallel()
  	e := &GitHubCopilotExecutor{}
  	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
@@ -687,9 +810,20 @@
  	}
  }
  
---- a/internal/translator/claude/openai/chat-completions/claude_openai_response.go	2026-03-20 04:44:43.549174950 +0000
-+++ b/internal/translator/claude/openai/chat-completions/claude_openai_response.go	2026-03-20 04:50:41.622602866 +0000
-@@ -282,6 +282,15 @@
+@@ -563,7 +528,7 @@ func TestApplyHeaders_OpenAIIntentValue(t *testing.T) {
+ 	t.Parallel()
+ 	e := &GitHubCopilotExecutor{}
+ 	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+-	e.applyHeaders(req, "token", nil)
++	e.applyHeaders(req, "token", sdktranslator.FormatOpenAI, nil)
+ 	if got := req.Header.Get("Openai-Intent"); got != "conversation-edits" {
+ 		t.Fatalf("Openai-Intent = %q, want conversation-edits", got)
+ 	}
+diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_response.go b/internal/translator/claude/openai/chat-completions/claude_openai_response.go
+index 6ae65cc5..423beeba 100644
+--- a/internal/translator/claude/openai/chat-completions/claude_openai_response.go
++++ b/internal/translator/claude/openai/chat-completions/claude_openai_response.go
+@@ -291,6 +291,15 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
  		chunks = append(chunks, bytes.TrimSpace(line[5:]))
  	}
  
@@ -703,18 +837,17 @@
 +	}
 +
  	// Base OpenAI non-streaming response template
- 	out := `{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+ 	out := []byte(`{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
  
-@@ -433,4 +442,76 @@
- 	}
+@@ -440,3 +449,75 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
  
  	return out
-+}
+ }
 +
 +// convertPlainClaudeResponseToOpenAI converts a plain (non-SSE) Claude Messages API
 +// response into OpenAI chat completion format. This handles responses from endpoints
 +// like Copilot's /v1/messages when stream=false.
-+func convertPlainClaudeResponseToOpenAI(root gjson.Result) string {
++func convertPlainClaudeResponseToOpenAI(root gjson.Result) []byte {
 +	out := `{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
 +
 +	out, _ = sjson.Set(out, "id", root.Get("id").String())
@@ -780,11 +913,13 @@
 +		}
 +	}
 +
-+	return out
- }
---- a/sdk/api/handlers/handlers.go	2026-03-20 04:44:43.553174966 +0000
-+++ b/sdk/api/handlers/handlers.go	2026-03-20 04:50:53.370649757 +0000
-@@ -801,6 +801,17 @@
++	return []byte(out)
++}
+diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
+index cc371325..471b5c22 100644
+--- a/sdk/api/handlers/handlers.go
++++ b/sdk/api/handlers/handlers.go
+@@ -806,6 +806,17 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
  	if len(providers) == 0 && baseModel != resolvedModelName {
  		providers = util.GetProviderName(resolvedModelName)
  	}
@@ -802,21 +937,20 @@
  
  	if len(providers) == 0 {
  		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
---- a/sdk/api/handlers/openai/endpoint_compat.go	2026-03-20 04:44:43.553174966 +0000
-+++ b/sdk/api/handlers/openai/endpoint_compat.go	2026-03-20 04:51:13.378729617 +0000
-@@ -1,6 +1,10 @@
+diff --git a/sdk/api/handlers/openai/endpoint_compat.go b/sdk/api/handlers/openai/endpoint_compat.go
+index 991e863c..a94704a4 100644
+--- a/sdk/api/handlers/openai/endpoint_compat.go
++++ b/sdk/api/handlers/openai/endpoint_compat.go
+@@ -1,6 +1,8 @@
  package openai
  
--import "github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-+import (
+ import (
 +	"strings"
 +
-+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-+)
- 
- const (
- 	openAIChatEndpoint      = "/chat/completions"
-@@ -11,7 +15,12 @@
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+ )
+@@ -14,7 +16,12 @@ func resolveEndpointOverride(modelName, requestedEndpoint string) (string, bool)
  	if modelName == "" {
  		return "", false
  	}
@@ -827,12 +961,14 @@
 +	if info == nil {
 +		info = registry.GetGlobalRegistry().GetModelInfo(modelName, "")
 +	}
- 	if info == nil || len(info.SupportedEndpoints) == 0 {
- 		return "", false
- 	}
---- a/sdk/api/handlers/openai/openai_handlers.go	2026-03-20 04:44:43.557174982 +0000
-+++ b/sdk/api/handlers/openai/openai_handlers.go	2026-03-20 04:51:36.622822393 +0000
-@@ -11,6 +11,7 @@
+ 	if info == nil {
+ 		baseModel := thinking.ParseSuffix(modelName).ModelName
+ 		if baseModel != "" && baseModel != modelName {
+diff --git a/sdk/api/handlers/openai/openai_handlers.go b/sdk/api/handlers/openai/openai_handlers.go
+index 8d765105..23f15041 100644
+--- a/sdk/api/handlers/openai/openai_handlers.go
++++ b/sdk/api/handlers/openai/openai_handlers.go
+@@ -11,6 +11,7 @@ import (
  	"encoding/json"
  	"fmt"
  	"net/http"
@@ -840,7 +976,7 @@
  	"sync"
  
  	"github.com/gin-gonic/gin"
-@@ -115,6 +116,11 @@
+@@ -115,6 +116,11 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
  
  	modelName := gjson.GetBytes(rawJSON, "model").String()
  	if overrideEndpoint, ok := resolveEndpointOverride(modelName, openAIChatEndpoint); ok && overrideEndpoint == openAIResponsesEndpoint {

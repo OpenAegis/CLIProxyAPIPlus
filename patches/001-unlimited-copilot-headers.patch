@@ -1,15 +1,14 @@
-# PATCH 001: Spoof Copilot headers for unlimited access
+# PATCH 001: Unlimited Copilot Headers
 #
-# Updates GitHub Copilot API headers to spoof premium/unlimited access:
-# - User-Agent, Editor-Version, Plugin-Version updated to latest
-# - OpenAI-Intent set to "conversation-edits" (matches latest Copilot)
-# - API version updated to 2025-10-01
-# - Forces X-Initiator to "agent" (bypasses dynamic logic)
-# - Adds random VScode-SessionId and VScode-MachineId
+# Updates GitHub Copilot header constants to spoof premium/unlimited access:
+# - Updated User-Agent, Editor-Version, Plugin-Version, and API version strings
+# - Added copilotThinkingBeta constant
+# - Force X-Initiator to "agent" on all requests (bypasses premium quota)
+# - Added VScode-SessionId and VScode-MachineId headers
 diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/runtime/executor/github_copilot_executor.go
 --- a/internal/runtime/executor/github_copilot_executor.go
 +++ b/internal/runtime/executor/github_copilot_executor.go
-@@ -35,12 +35,14 @@
+@@ -38,12 +38,13 @@
  	maxScannerBufferSize = 20_971_520
  
  	// Copilot API header values.
@@ -20,28 +19,26 @@ diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/run
 +	copilotEditorVersion = "vscode/1.109.3"
 +	copilotPluginVersion = "copilot-chat/0.37.2026013101"
  	copilotIntegrationID = "vscode-chat"
--	copilotOpenAIIntent  = "conversation-panel"
+ 	copilotOpenAIIntent  = "conversation-edits"
 -	copilotGitHubAPIVer  = "2025-04-01"
-+	copilotOpenAIIntent  = "conversation-edits"
 +	copilotGitHubAPIVer  = "2025-10-01"
-+	// Additional headers for unlimited premium requests
 +	copilotThinkingBeta  = "interleaved-thinking-2025-05-14,context-management-2025-06-27"
  )
  
  // GitHubCopilotExecutor handles requests to the GitHub Copilot API.
-@@ -489,11 +491,10 @@
+@@ -528,12 +529,9 @@
+ 	r.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
  	r.Header.Set("X-Github-Api-Version", copilotGitHubAPIVer)
  	r.Header.Set("X-Request-Id", uuid.NewString())
- 
+-
 -	initiator := "user"
--	if role := detectLastConversationRole(body); role == "assistant" || role == "tool" {
+-	if isAgentInitiated(body) {
 -		initiator = "agent"
 -	}
 -	r.Header.Set("X-Initiator", initiator)
-+	// Always set X-Initiator to "agent" for unlimited premium request access.
 +	r.Header.Set("X-Initiator", "agent")
 +	r.Header.Set("VScode-SessionId", uuid.NewString())
 +	r.Header.Set("VScode-MachineId", uuid.NewString())
  }
  
- func detectLastConversationRole(body []byte) string {
+ // isAgentInitiated determines whether the current request is agent-initiated

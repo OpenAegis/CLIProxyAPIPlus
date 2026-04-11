@@ -15,8 +15,9 @@
 # 3. Project ID: Expand word pools from ~10 to ~30 adjectives/nouns for
 #    more realistic random project names.
 #
---- a/internal/runtime/executor/antigravity_executor.go	2026-03-20 04:35:24.918938583 +0000
-+++ b/internal/runtime/executor/antigravity_executor.go	2026-03-20 04:37:06.191344008 +0000
+diff --git a/internal/runtime/executor/antigravity_executor.go b/internal/runtime/executor/antigravity_executor.go
+--- a/internal/runtime/executor/antigravity_executor.go
++++ b/internal/runtime/executor/antigravity_executor.go
 @@ -10,6 +10,7 @@
  	"crypto/sha256"
  	"crypto/tls"
@@ -33,7 +34,15 @@
  	"strconv"
  	"strings"
  	"sync"
-@@ -50,11 +52,108 @@
+@@ -25,7 +27,6 @@
+ 	"github.com/google/uuid"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+ 	antigravityclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/antigravity/claude"
+@@ -58,6 +59,11 @@
  	// systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
  )
  
@@ -42,9 +51,17 @@
 +	antigravityVersionRefresh = 12 * time.Hour
 +)
 +
+ type antigravity429Category string
+ 
+ type antigravityCreditsFailureState struct {
+@@ -87,8 +93,24 @@
+ }
+ 
  var (
- 	randSource      = rand.New(rand.NewSource(time.Now().UnixNano()))
- 	randSourceMutex sync.Mutex
+-	randSource                        = rand.New(rand.NewSource(time.Now().UnixNano()))
+-	randSourceMutex                   sync.Mutex
++	randSource      = rand.New(rand.NewSource(time.Now().UnixNano()))
++	randSourceMutex sync.Mutex
 +
 +	antigravityUACache      = make(map[string]string)
 +	antigravityUACacheMutex sync.RWMutex
@@ -60,6 +77,12 @@
 +	antigravityDynVersionMu sync.RWMutex
 +	antigravityDynVersionAt time.Time
 +	antigravityVersionRe    = regexp.MustCompile(`\d+\.\d+\.\d+`)
++
+ 	antigravityCreditsFailureByAuth   sync.Map
+ 	antigravityPreferCreditsByModel   sync.Map
+ 	antigravityShortCooldownByAuth    sync.Map
+@@ -112,6 +134,83 @@
+ 	}
  )
  
 +func fetchAntigravityVersion() string {
@@ -142,7 +165,7 @@
  // AntigravityExecutor proxies requests to the antigravity upstream.
  type AntigravityExecutor struct {
  	cfg *config.Config
-@@ -1246,7 +1345,11 @@
+@@ -1942,7 +2041,11 @@
  			projectID = strings.TrimSpace(pid)
  		}
  	}
@@ -155,9 +178,9 @@
  	payload, _ = sjson.SetBytes(payload, "model", modelName)
  
  	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
-@@ -1294,9 +1397,8 @@
- 		httpReq.Host = host
+@@ -1996,9 +2099,8 @@
  	}
+ 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
  
 -	var authID, authLabel, authType, authValue string
 +	var authLabel, authType, authValue string
@@ -166,7 +189,7 @@
  		authLabel = auth.Label
  		authType, authValue = auth.AccountInfo()
  	}
-@@ -1407,6 +1509,39 @@
+@@ -2109,8 +2211,41 @@
  				return strings.TrimSpace(ua)
  			}
  		}
@@ -204,36 +227,39 @@
 +			return ua
 +		}
  	}
- 	return defaultAntigravityAgent
+-	return misc.AntigravityUserAgent()
++	return defaultAntigravityAgent
  }
-@@ -1498,7 +1633,7 @@
+ 
+ func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
+@@ -2296,7 +2431,7 @@
  	return ""
  }
  
 -func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
 +func geminiToAntigravity(modelName string, payload []byte, projectID string, authID string) []byte {
- 	template, _ := sjson.Set(string(payload), "model", modelName)
- 	template, _ = sjson.Set(template, "userAgent", "antigravity")
- 
-@@ -1516,14 +1651,15 @@
+ 	template := payload
+ 	template, _ = sjson.SetBytes(template, "model", modelName)
+ 	template, _ = sjson.SetBytes(template, "userAgent", "antigravity")
+@@ -2315,14 +2450,15 @@
  	if projectID != "" {
- 		template, _ = sjson.Set(template, "project", projectID)
+ 		template, _ = sjson.SetBytes(template, "project", projectID)
  	} else {
--		template, _ = sjson.Set(template, "project", generateProjectID())
+-		template, _ = sjson.SetBytes(template, "project", generateProjectID())
 +		projectID = generateProjectID()
-+		template, _ = sjson.Set(template, "project", projectID)
++		template, _ = sjson.SetBytes(template, "project", projectID)
  	}
  
  	if isImageModel {
- 		template, _ = sjson.Set(template, "requestId", generateImageGenRequestID())
+ 		template, _ = sjson.SetBytes(template, "requestId", generateImageGenRequestID())
  	} else {
- 		template, _ = sjson.Set(template, "requestId", generateRequestID())
--		template, _ = sjson.Set(template, "request.sessionId", generateStableSessionID(payload))
-+		template, _ = sjson.Set(template, "request.sessionId", generateStableSessionID(payload, authID, modelName, projectID))
+ 		template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
+-		template, _ = sjson.SetBytes(template, "request.sessionId", generateStableSessionID(payload))
++		template, _ = sjson.SetBytes(template, "request.sessionId", generateStableSessionID(payload, authID, modelName, projectID))
  	}
  
- 	template, _ = sjson.Delete(template, "request.safetySettings")
-@@ -1549,26 +1685,59 @@
+ 	template, _ = sjson.DeleteBytes(template, "request.safetySettings")
+@@ -2348,26 +2484,59 @@
  	return "-" + strconv.FormatInt(n, 10)
  }
  
