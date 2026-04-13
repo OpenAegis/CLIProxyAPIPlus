@@ -13,10 +13,9 @@
 #    instead of generating a new random UUID per request.
 #
 # 3. Mixed X-Initiator: Instead of always sending "agent" (which is the most
-#    obvious anomaly), 80% of requests use "agent" for unlimited premium access
-#    and 20% use the real dynamic value based on message content. This makes
-#    the account's usage pattern look like a normal VS Code user who happens
-#    to use agent mode frequently.
+#    obvious anomaly), 95% of requests use "agent" for unlimited premium access
+#    and 5% use the real dynamic value based on message content. This keeps
+#    premium usage alive occasionally without burning through the quota as fast.
 #
 diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/runtime/executor/github_copilot_executor.go
 --- a/internal/runtime/executor/github_copilot_executor.go
@@ -41,7 +40,7 @@ diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/run
 +	// copilotAgentRatio is the fraction of requests that use X-Initiator "agent"
 +	// for unlimited premium access. The remainder use the real dynamic value
 +	// to blend in with normal VS Code traffic patterns.
-+	copilotAgentRatio = 0.80
++	copilotAgentRatio = 0.95
 +
 +	// copilotSessionRotation controls how often the synthetic VScode-SessionId
 +	// rotates, simulating editor restarts.
