@@ -14,7 +14,7 @@
 #
 # 3. Conversation-aware X-Initiator: First-seen conversation roots bill as
 #    "user", explicit tool loops and previous_response_id continuations stay
-#    "agent", warmed conversations flip back to "agent", and 1% of warmed
+#    "agent", warmed conversations flip back to "agent", and 2% of warmed
 #    follow-ups still use the real initiator for extra noise.
 #
 diff --git a/internal/runtime/executor/github_copilot_executor.go b/internal/runtime/executor/github_copilot_executor.go
@@ -38,7 +38,7 @@ index 7335439..6086e98 100644
 +
 +	// copilotWarmConversationRealRatio is the small fraction of warmed
 +	// conversations that still use the real X-Initiator value for extra noise.
-+	copilotWarmConversationRealRatio = 0.01
++	copilotWarmConversationRealRatio = 0.02
 +
 +	// copilotSessionRotation controls how often the synthetic VScode-SessionId
 +	// rotates, simulating editor restarts.
@@ -47,7 +47,7 @@ index 7335439..6086e98 100644
 +	// copilotWarmConversationTTL controls how long a conversation root stays warm.
 +	// First-seen roots bill as "user"; later turns for the same root flip to
 +	// "agent" until the warm entry expires.
-+	copilotWarmConversationTTL = 12 * time.Hour
++	copilotWarmConversationTTL = 6 * time.Hour
 +
 +	// copilotWarmConversationCleanupInterval controls how often expired warm
 +	// conversation entries are purged.
