@@ -2,19 +2,136 @@
 
 English | [Chinese](README_CN.md)
 
-This repository is `lemon07r/CLIProxyAPIPlus`, a fork of the upstream [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) Plus branch.
+This repository is `lemon07r/CLIProxyAPIPlus`, a fork of the upstream [CLIProxyAPI Plus](https://github.com/router-for-me/CLIProxyAPIPlus) branch. The fork stays close to upstream and carries a small patch stack for Copilot and Antigravity behavior that is applied during Docker builds.
 
-It stays close to upstream while carrying a small fork-specific patch stack that is applied during Docker builds from the files in [`patches/`](patches/). Those patches currently cover custom Copilot behavior, Copilot Claude endpoint handling, streaming fixes, and Antigravity compatibility/fingerprinting adjustments.
+Published images for this fork are available on Docker Hub as [`lemon07r/cli-proxy-api-plus`](https://hub.docker.com/r/lemon07r/cli-proxy-api-plus). On pushes to `main`, the fork's `build-and-push.yml` workflow syncs upstream, builds an ARM64 image, and pushes `latest`. Tagged builds use `docker-image.yml` for multi-arch releases.
 
-Published images for this fork are available on Docker Hub as [`lemon07r/cli-proxy-api-plus`](https://hub.docker.com/r/lemon07r/cli-proxy-api-plus). The fork is intended to stay in lockstep with upstream Plus features apart from the patch set above.
+## What Is Different In This Fork
+
+- Custom behavior lives in [`patches/`](patches/), not as long-lived source edits.
+- The Docker build applies patch files in lexical order during `docker build`.
+- The goal is to stay mergeable with upstream while keeping the fork-specific behavior isolated.
+
+If you change Go source directly and commit that source change instead of updating the matching patch file, the next upstream sync will overwrite your work. For fork maintenance, treat the patch files as the real source of truth.
+
+## How The Patch Build Works
+
+1. The repo tracks upstream normally.
+2. Fork changes live as numbered patch files in [`patches/`](patches/).
+3. [`Dockerfile`](Dockerfile) copies the repo, then applies `patches/*.patch` in sorted order.
+4. The patched tree is compiled into the final `CLIProxyAPIPlus` binary.
+
+That means the important workflow is:
+
+```bash
+# 1. Apply earlier patches to get the right baseline
+git apply patches/001-unlimited-copilot-headers.patch
+# ...apply through the patch before the one you are editing
+
+# 2. Edit the source file temporarily
+
+# 3. Generate/update the patch file
+
+# 4. Revert temporary source edits before committing
+git checkout -- internal/ sdk/
+```
+
+## Patch Stack
+
+| Patch | Purpose |
+|---|---|
+| `001-unlimited-copilot-headers.patch` | Spoofs Copilot/VS Code headers and sets the Copilot header baseline used by the fork. |
+| `002-copilot-claude-endpoint.patch` | Routes Claude models to Copilot's `/v1/messages`, uses `/responses` for GPT-5.3/Codex-style models, strips the `copilot-` prefix, and improves Copilot Claude streaming/thinking behavior. |
+| `003-antigravity-claude-thinking-signature-fix.patch` | Fixes Claude thinking signature handling for Antigravity translators. |
+| `004-antigravity-assistant-prefill-fix.patch` | Fixes assistant prefill handling for Antigravity Claude/Gemini requests. |
+| `005-antigravity-merge-consecutive-turns.patch` | Merges consecutive same-role turns for Antigravity backends. |
+| `006-antigravity-anti-fingerprinting.patch` | Improves Antigravity session and fingerprint generation. |
+| `007-copilot-responses-vision-detection.patch` | Extends Copilot vision detection to the Responses API input format. |
+| `008-streaming-tool-call-deltas.patch` | Streams Claude tool call argument deltas incrementally in the Claude-to-OpenAI translator. |
+| `009-copilot-anti-fingerprinting.patch` | Adds per-account Copilot header diversity, persistent MachineId/SessionId behavior, and conversation-aware `X-Initiator` billing logic. |
+| `010-copilot-session-warm-keys.patch` | Keeps warmed Copilot sessions warm across transcript compaction by hashing stable execution/session identifiers in addition to the visible root prompt. |
+
+## Common Workflows
+
+### Run The Prebuilt Image
+
+```bash
+./docker-build.sh
+# choose option 1
+```
+
+Or directly:
+
+```bash
+docker compose up -d --remove-orphans --no-build
+```
+
+### Build From Source Locally
+
+```bash
+./docker-build.sh
+# choose option 2
+```
+
+Or directly:
+
+```bash
+docker build -t cliproxy-api-plus:local .
+docker compose up -d --remove-orphans --pull never
+```
+
+### Build An x86/amd64 Image On ARM
+
+If you are on an ARM VPS but need to test the x86 build locally:
+
+```bash
+docker buildx build --platform linux/amd64 -t cliproxy-api-plus:amd64 --load .
+```
+
+If you want to publish that image instead of loading it into the local Docker daemon:
+
+```bash
+docker buildx build --platform linux/amd64 -t yourname/cli-proxy-api-plus:amd64 --push .
+```
+
+### Test The Patch Chain Cleanly
+
+```bash
+git checkout -- internal/ sdk/
+
+for patch in patches/*.patch; do
+  git apply "$patch"
+done
+
+docker run --rm -v "$PWD:/src" -w /src golang:1.26-alpine \
+  sh -lc '/usr/local/go/bin/go test ./internal/runtime/executor -run "TestApplyHeaders_XInitiator|TestApplyHeaders_GitHubAPIVersion|TestApplyHeaders_OpenAIIntentValue"'
+
+git checkout -- internal/ sdk/
+```
+
+### Push A Fork Change Live
+
+```bash
+git add patches/ README.md
+git commit -m "your message"
+git push origin main
+```
+
+After that:
+
+- `build-and-push.yml` builds and publishes the ARM64 Docker image
+- tagged builds can use `docker-image.yml` for multi-arch releases
+- if your server uses watchtower, it will pull the new `latest` automatically
+- if not, pull and restart manually with `docker compose pull && docker compose up -d`
+
+## Repo Layout Notes
+
+- [`docker-compose.yml`](docker-compose.yml) is the repo-local compose file for building or running this repo directly.
+- [`docker-build.sh`](docker-build.sh) is the easiest beginner-friendly entry point for local builds.
+- [`config.example.yaml`](config.example.yaml) is the main config reference.
+- Production deployments often keep a separate runtime directory that mounts `config.yaml`, `auths/`, and `logs/` into the container instead of running straight from the git checkout.
 
 All third-party provider support is maintained by community contributors; upstream CLIProxyAPI does not provide technical support for fork-specific changes. If you need help with this fork, contact the corresponding fork maintainer.
-
-## Fork Notes
-
-- Fork customizations should be added as `.patch` files under [`patches/`](patches/) rather than committed as direct source edits.
-- Docker builds apply patches in lexical order, so patch filenames define the customization order.
-- If upstream changes break patch application, regenerate the affected patch against the new upstream baseline and keep the patch chain clean.
 
 ## Contributing
 
