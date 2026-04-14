@@ -2,11 +2,19 @@
 
 English | [Chinese](README_CN.md)
 
-This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), adding support for third-party providers on top of the mainline project.
+This repository is `lemon07r/CLIProxyAPIPlus`, a fork of the upstream [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) Plus branch.
 
-All third-party provider support is maintained by community contributors; CLIProxyAPI does not provide technical support. Please contact the corresponding community maintainer if you need assistance.
+It stays close to upstream while carrying a small fork-specific patch stack that is applied during Docker builds from the files in [`patches/`](patches/). Those patches currently cover custom Copilot behavior, Copilot Claude endpoint handling, streaming fixes, and Antigravity compatibility/fingerprinting adjustments.
 
-The Plus release stays in lockstep with the mainline features.
+Published images for this fork are available on Docker Hub as [`lemon07r/cli-proxy-api-plus`](https://hub.docker.com/r/lemon07r/cli-proxy-api-plus). The fork is intended to stay in lockstep with upstream Plus features apart from the patch set above.
+
+All third-party provider support is maintained by community contributors; upstream CLIProxyAPI does not provide technical support for fork-specific changes. If you need help with this fork, contact the corresponding fork maintainer.
+
+## Fork Notes
+
+- Fork customizations should be added as `.patch` files under [`patches/`](patches/) rather than committed as direct source edits.
+- Docker builds apply patches in lexical order, so patch filenames define the customization order.
+- If upstream changes break patch application, regenerate the affected patch against the new upstream baseline and keep the patch chain clean.
 
 ## Contributing
 
