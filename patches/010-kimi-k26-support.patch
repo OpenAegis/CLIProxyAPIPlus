@@ -1,0 +1,230 @@
+# PATCH 010: Kimi K2.6 (kimi-for-coding) support
+#
+# Updates the Kimi executor, OAuth client, thinking applier and model registry
+# so the proxy is served Kimi K2.6 ("kimi-for-coding") instead of silently
+# falling back to K2.5. Reverse-engineered from upstream Kimi Code CLI v1.35.0
+# (kosong SDK + kimi_cli package).
+#
+# Summary of changes:
+#   * internal/runtime/executor/kimi_executor.go
+#       - Bump advertised CLI version from 1.10.6 -> 1.35.0 (User-Agent,
+#         X-Msh-Version) and rename User-Agent product to "KimiCodeCLI".
+#       - Add X-Msh-Os-Version header (the real CLI sends 7 X-Msh-* headers,
+#         we were sending 6).
+#       - Whitelist "kimi-for-coding" in stripKimiPrefix() so the upstream
+#         model identifier is sent verbatim; stripping the "kimi-" prefix
+#         caused the backend to reject the model name.
+#   * internal/auth/kimi/kimi.go
+#       - Change device-flow / refresh OAuth common headers from
+#         X-Msh-Platform=cli-proxy-api / X-Msh-Version=1.0.0 to
+#         X-Msh-Platform=kimi_cli / X-Msh-Version=1.35.0 so auth traffic is
+#         indistinguishable from the real kimi-cli. Stale CLI versions can be
+#         refused refresh tokens.
+#   * internal/thinking/provider/kimi/apply.go (+ apply_test.go)
+#       - When thinking is enabled, also set thinking.type="enabled" alongside
+#         reasoning_effort. The Kimi Code CLI sends BOTH fields simultaneously
+#         via the kosong Kimi.with_thinking() helper; sending only
+#         reasoning_effort leaves K2.6 thinking silently disabled.
+#   * internal/registry/model_definitions.go
+#       - Declare "kimi-for-coding" as a static override in GetKimiModels()
+#         so the model is registered even when the remote models.json catalog
+#         has not yet picked up K2.6 (context 262144, thinking: ZeroAllowed).
+#
+# Follow-ups not included in this patch:
+#   - prompt_cache_key support (guide section 6) requires threading a session
+#     identifier from the client layer; deferred.
+#
+diff --git a/internal/auth/kimi/kimi.go b/internal/auth/kimi/kimi.go
+index ccb1a6c2..5faf3f19 100644
+--- a/internal/auth/kimi/kimi.go
++++ b/internal/auth/kimi/kimi.go
+@@ -162,11 +162,19 @@ func getHostname() string {
+ 	return hostname
+ }
+ 
+-// commonHeaders returns headers required for Kimi API requests.
++// kimiCLIVersion is kept in sync with the version advertised by outbound
++// chat/completions traffic (see internal/runtime/executor/kimi_executor.go).
++// Kimi's auth server cross-checks these headers against the CLI version and
++// may refuse refresh / device-flow tokens from obviously stale clients.
++const kimiCLIVersion = "1.35.0"
++
++// commonHeaders returns headers required for Kimi API requests. These match
++// the upstream kimi-cli oauth.common_headers() implementation so that device
++// flow and refresh traffic is indistinguishable from the real CLI.
+ func (c *DeviceFlowClient) commonHeaders() map[string]string {
+ 	return map[string]string{
+-		"X-Msh-Platform":     "cli-proxy-api",
+-		"X-Msh-Version":      "1.0.0",
++		"X-Msh-Platform":     "kimi_cli",
++		"X-Msh-Version":      kimiCLIVersion,
+ 		"X-Msh-Device-Name":  getHostname(),
+ 		"X-Msh-Device-Model": getDeviceModel(),
+ 		"X-Msh-Device-Id":    c.deviceID,
+diff --git a/internal/registry/model_definitions.go b/internal/registry/model_definitions.go
+index 28706795..a0ba5dd4 100644
+--- a/internal/registry/model_definitions.go
++++ b/internal/registry/model_definitions.go
+@@ -66,9 +66,39 @@ func GetCodexProModels() []*ModelInfo {
+ 	return cloneModelInfos(getModels().CodexPro)
+ }
+ 
+-// GetKimiModels returns the standard Kimi (Moonshot AI) model definitions.
++// kimiForCodingModelID is the upstream identifier for the Kimi K2.6 coding
++// model (a.k.a. "Kimi K2.6 Code Preview"). It is served by Kimi's coding
++// endpoint to OAuth JWT clients whose token was issued with the "kimi-code"
++// scope. This entry is declared statically (rather than relying on the
++// remote models.json catalog) so that the model remains registered even when
++// the upstream catalog has not yet picked up K2.6.
++const kimiForCodingModelID = "kimi-for-coding"
++
++// GetKimiModels returns the standard Kimi (Moonshot AI) model definitions,
++// merging the remote/embedded models.json catalog with a small set of static
++// overrides required by the fork (currently: kimi-for-coding / K2.6).
+ func GetKimiModels() []*ModelInfo {
+-	return cloneModelInfos(getModels().Kimi)
++	models := cloneModelInfos(getModels().Kimi)
++	for _, m := range models {
++		if m != nil && strings.EqualFold(m.ID, kimiForCodingModelID) {
++			return models
++		}
++	}
++	now := int64(1768608000) // 2026-01-17
++	models = append(models, &ModelInfo{
++		ID:                  kimiForCodingModelID,
++		Object:              "model",
++		Created:             now,
++		OwnedBy:             "moonshot",
++		Type:                "kimi",
++		DisplayName:         "Kimi K2.6 Code Preview",
++		Description:         "Kimi K2.6-code-preview (kimi-for-coding) - requires OAuth kimi-code scope",
++		ContextLength:       262144,
++		MaxCompletionTokens: 32768,
++		Thinking:            &ThinkingSupport{ZeroAllowed: true},
++		SupportedEndpoints:  []string{"/chat/completions"},
++	})
++	return models
+ }
+ 
+ // GetAntigravityModels returns the standard Antigravity model definitions.
+diff --git a/internal/runtime/executor/kimi_executor.go b/internal/runtime/executor/kimi_executor.go
+index 931e3a56..f70c9c78 100644
+--- a/internal/runtime/executor/kimi_executor.go
++++ b/internal/runtime/executor/kimi_executor.go
+@@ -494,18 +494,26 @@ func (e *KimiExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
+ 	return auth, nil
+ }
+ 
++// kimiCLIVersion is the Kimi Code CLI version string we advertise on outbound
++// requests. Kimi backend uses these headers (together with the JWT scope) to
++// decide which model generation to serve. Older CLI versions get routed to
++// K2.5; current CLIs (and therefore this proxy) must advertise the current
++// kimi-cli version to be served K2.6 (kimi-for-coding).
++const kimiCLIVersion = "1.35.0"
++
+ // applyKimiHeaders sets required headers for Kimi API requests.
+ // Headers match kimi-cli client for compatibility.
+ func applyKimiHeaders(r *http.Request, token string, stream bool) {
+ 	r.Header.Set("Content-Type", "application/json")
+ 	r.Header.Set("Authorization", "Bearer "+token)
+ 	// Match kimi-cli headers exactly
+-	r.Header.Set("User-Agent", "KimiCLI/1.10.6")
++	r.Header.Set("User-Agent", "KimiCodeCLI/"+kimiCLIVersion)
+ 	r.Header.Set("X-Msh-Platform", "kimi_cli")
+-	r.Header.Set("X-Msh-Version", "1.10.6")
++	r.Header.Set("X-Msh-Version", kimiCLIVersion)
+ 	r.Header.Set("X-Msh-Device-Name", getKimiHostname())
+ 	r.Header.Set("X-Msh-Device-Model", getKimiDeviceModel())
+ 	r.Header.Set("X-Msh-Device-Id", getKimiDeviceID())
++	r.Header.Set("X-Msh-Os-Version", getKimiOsVersion())
+ 	if stream {
+ 		r.Header.Set("Accept", "text/event-stream")
+ 		return
+@@ -513,6 +521,13 @@ func applyKimiHeaders(r *http.Request, token string, stream bool) {
+ 	r.Header.Set("Accept", "application/json")
+ }
+ 
++// getKimiOsVersion returns an OS version string for the X-Msh-Os-Version
++// header. Mirrors kimi-cli's behaviour of sending a coarse OS identifier so
++// the backend can apply per-platform routing.
++func getKimiOsVersion() string {
++	return fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
++}
++
+ func resolveKimiDeviceIDFromAuth(auth *cliproxyauth.Auth) string {
+ 	if auth == nil || auth.Metadata == nil {
+ 		return ""
+@@ -624,10 +639,26 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
+ 	return ""
+ }
+ 
+-// stripKimiPrefix removes the "kimi-" prefix from model names for the upstream API.
++// kimiPreservedModels is the set of upstream model IDs that happen to start
++// with the literal prefix "kimi-" but MUST be forwarded to the backend
++// verbatim. In particular "kimi-for-coding" is the on-wire identifier for the
++// K2.6 coding model; stripping the prefix would route the request to a
++// non-existent model and cause the backend to fall back to an older
++// generation.
++var kimiPreservedModels = map[string]struct{}{
++	"kimi-for-coding": {},
++}
++
++// stripKimiPrefix removes the "kimi-" prefix from model names for the upstream
++// API, except for models explicitly whitelisted in kimiPreservedModels which
++// are sent verbatim.
+ func stripKimiPrefix(model string) string {
+ 	model = strings.TrimSpace(model)
+-	if strings.HasPrefix(strings.ToLower(model), "kimi-") {
++	lower := strings.ToLower(model)
++	if _, preserved := kimiPreservedModels[lower]; preserved {
++		return model
++	}
++	if strings.HasPrefix(lower, "kimi-") {
+ 		return model[5:]
+ 	}
+ 	return model
+diff --git a/internal/thinking/provider/kimi/apply.go b/internal/thinking/provider/kimi/apply.go
+index ff47c46d..97cec304 100644
+--- a/internal/thinking/provider/kimi/apply.go
++++ b/internal/thinking/provider/kimi/apply.go
+@@ -131,6 +131,11 @@ func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, e
+ }
+ 
+ func applyReasoningEffort(body []byte, effort string) ([]byte, error) {
++	// Mirror the upstream Kimi Code CLI (kosong SDK) which sends BOTH
++	// reasoning_effort and thinking.type="enabled" simultaneously when
++	// thinking is active. Sending only reasoning_effort causes some model
++	// generations (notably K2.6 / kimi-for-coding) to run with thinking
++	// silently disabled.
+ 	result, errDeleteThinking := sjson.DeleteBytes(body, "thinking")
+ 	if errDeleteThinking != nil {
+ 		return body, fmt.Errorf("kimi thinking: failed to clear thinking object: %w", errDeleteThinking)
+@@ -139,6 +144,10 @@ func applyReasoningEffort(body []byte, effort string) ([]byte, error) {
+ 	if errSetEffort != nil {
+ 		return body, fmt.Errorf("kimi thinking: failed to set reasoning_effort: %w", errSetEffort)
+ 	}
++	result, errSetType := sjson.SetBytes(result, "thinking.type", "enabled")
++	if errSetType != nil {
++		return body, fmt.Errorf("kimi thinking: failed to set thinking.type: %w", errSetType)
++	}
+ 	return result, nil
+ }
+ 
+diff --git a/internal/thinking/provider/kimi/apply_test.go b/internal/thinking/provider/kimi/apply_test.go
+index 707f11c7..7846f7c9 100644
+--- a/internal/thinking/provider/kimi/apply_test.go
++++ b/internal/thinking/provider/kimi/apply_test.go
+@@ -46,8 +46,11 @@ func TestApply_ModeLevel_UsesReasoningEffort(t *testing.T) {
+ 	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+ 		t.Fatalf("reasoning_effort = %q, want %q, body=%s", got, "high", string(out))
+ 	}
+-	if gjson.GetBytes(out, "thinking").Exists() {
+-		t.Fatalf("thinking should be removed when reasoning_effort is used, body=%s", string(out))
++	// Kimi Code CLI sends thinking.type="enabled" alongside reasoning_effort
++	// when thinking is active. The proxy mirrors that wire format so the
++	// backend routes the request to the thinking-capable model generation.
++	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
++		t.Fatalf("thinking.type = %q, want %q, body=%s", got, "enabled", string(out))
+ 	}
+ }
+ 
