@@ -6,7 +6,7 @@ This repository is `lemon07r/CLIProxyAPIPlus`, a fork of the upstream [CLIProxyA
 
 Published images for this fork are available on Docker Hub as [`lemon07r/cli-proxy-api-plus`](https://hub.docker.com/r/lemon07r/cli-proxy-api-plus). On pushes to `main`, the fork's `build-and-push.yml` workflow syncs upstream, builds an ARM64 image, and pushes `latest`. Tagged builds use `docker-image.yml` for multi-arch releases.
 
-The current fork-specific stack is intentionally small: nine numbered patches grouped around Copilot routing/fingerprinting, Antigravity compatibility/fingerprinting, and one Claude streaming fix. When a later tweak is really just an extension of an existing feature, the preferred maintenance move is to fold it back into that patch instead of piling on more tiny follow-up patches.
+The current fork-specific stack is intentionally small: ten numbered patches grouped around Copilot routing/fingerprinting, Antigravity compatibility/fingerprinting, a Claude streaming fix, and Kimi K2.6 coding-model support. When a later tweak is really just an extension of an existing feature, the preferred maintenance move is to fold it back into that patch instead of piling on more tiny follow-up patches.
 
 ## What Is Different In This Fork
 
@@ -51,12 +51,14 @@ git checkout -- internal/ sdk/
 | `007-copilot-responses-vision-detection.patch` | Extends Copilot vision detection to Responses API `input[]` image items. |
 | `008-streaming-tool-call-deltas.patch` | Streams Claude tool call argument deltas incrementally in the Claude-to-OpenAI translator. |
 | `009-copilot-anti-fingerprinting.patch` | Adds per-account Copilot header diversity, persistent MachineId/SessionId behavior, conversation-aware warm-session billing, compaction-stable warm keys, and cold-session startup reservation. |
+| `010-kimi-k26-support.patch` | Kimi K2.6 (`kimi-for-coding`) support: updated `kimi_cli/1.35.0` headers (UA, `X-Msh-Version`, `X-Msh-Os-Version`) in both chat traffic and OAuth device-flow, whitelists `kimi-for-coding` in prefix stripping, emits `thinking.type="enabled"` alongside `reasoning_effort`, attaches a deterministic `prompt_cache_key` for `kimi-for-coding` only, and registers a static `kimi-for-coding` model entry. Scoped entirely to the Kimi provider. |
 
 ## Patch Layout
 
 - `001`, `002`, `007`, `009`: Copilot executor behavior, endpoint routing, and fingerprinting/session policy.
 - `003`, `004`, `005`, `006`: Antigravity request translation fixes plus anti-fingerprinting behavior.
 - `008`: Claude streaming translation fix.
+- `010`: Kimi provider support for the K2.6 coding model (`kimi-for-coding`) — headers, prefix handling, thinking wire format, prompt caching, and model registry.
 
 This split is deliberate. It keeps unrelated providers separated, but avoids stacking multiple tiny follow-up patches on the exact same Copilot session logic.
 

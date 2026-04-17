@@ -1,38 +1,35 @@
 # PATCH 010: Kimi K2.6 (kimi-for-coding) support
 #
-# Updates the Kimi executor, OAuth client, thinking applier and model registry
-# so the proxy is served Kimi K2.6 ("kimi-for-coding") instead of silently
-# falling back to K2.5. Reverse-engineered from upstream Kimi Code CLI v1.35.0
-# (kosong SDK + kimi_cli package).
+# Adds first-class support for the Kimi K2.6 coding model (upstream id
+# "kimi-for-coding") to the fork. Mirrors the current kimi-cli / kosong SDK
+# wire format so the backend routes our requests to the K2.6 generation
+# instead of silently falling back to K2.5.
 #
-# Summary of changes:
-#   * internal/runtime/executor/kimi_executor.go
-#       - Bump advertised CLI version from 1.10.6 -> 1.35.0 (User-Agent,
-#         X-Msh-Version) and rename User-Agent product to "KimiCodeCLI".
-#       - Add X-Msh-Os-Version header (the real CLI sends 7 X-Msh-* headers,
-#         we were sending 6).
-#       - Whitelist "kimi-for-coding" in stripKimiPrefix() so the upstream
-#         model identifier is sent verbatim; stripping the "kimi-" prefix
-#         caused the backend to reject the model name.
-#   * internal/auth/kimi/kimi.go
-#       - Change device-flow / refresh OAuth common headers from
-#         X-Msh-Platform=cli-proxy-api / X-Msh-Version=1.0.0 to
-#         X-Msh-Platform=kimi_cli / X-Msh-Version=1.35.0 so auth traffic is
-#         indistinguishable from the real kimi-cli. Stale CLI versions can be
-#         refused refresh tokens.
-#   * internal/thinking/provider/kimi/apply.go (+ apply_test.go)
-#       - When thinking is enabled, also set thinking.type="enabled" alongside
-#         reasoning_effort. The Kimi Code CLI sends BOTH fields simultaneously
-#         via the kosong Kimi.with_thinking() helper; sending only
-#         reasoning_effort leaves K2.6 thinking silently disabled.
-#   * internal/registry/model_definitions.go
-#       - Declare "kimi-for-coding" as a static override in GetKimiModels()
-#         so the model is registered even when the remote models.json catalog
-#         has not yet picked up K2.6 (context 262144, thinking: ZeroAllowed).
+# Changes (scoped entirely to Kimi; no other providers touched):
+#   - internal/runtime/executor/kimi_executor.go
+#       * Advertise KimiCodeCLI/1.35.0 user-agent and X-Msh-Version=1.35.0
+#       * New X-Msh-Os-Version header (GOOS + GOARCH)
+#       * Whitelist "kimi-for-coding" in stripKimiPrefix so the literal
+#         model id is forwarded verbatim to the backend
+#       * New applyKimiPromptCacheKey() that attaches a deterministic
+#         prompt_cache_key derived from sha256(authID || system || first
+#         user message) ONLY for kimi-for-coding, matching kimi-cli's
+#         llm.py behaviour. Client-provided prompt_cache_key wins.
+#   - internal/auth/kimi/kimi.go
+#       * Device-flow / refresh commonHeaders() now send
+#         X-Msh-Platform=kimi_cli and X-Msh-Version=1.35.0 instead of the
+#         old cli-proxy-api/1.0.0 identifier
+#   - internal/thinking/provider/kimi/apply.go (+ test)
+#       * When reasoning_effort is set, also set thinking.type="enabled"
+#         (kosong wire format). Without this, K2.6 runs with thinking
+#         silently disabled.
+#   - internal/registry/model_definitions.go
+#       * Static kimi-for-coding entry (262144 ctx, thinking-capable) so
+#         the model stays registered even if the remote models.json catalog
+#         is refreshed without it.
 #
-# Follow-ups not included in this patch:
-#   - prompt_cache_key support (guide section 6) requires threading a session
-#     identifier from the client layer; deferred.
+# All changes are gated to the Kimi provider / kimi-for-coding model id, so
+# Antigravity, Copilot, Claude, Gemini, Codex, etc. behaviour is unchanged.
 #
 diff --git a/internal/auth/kimi/kimi.go b/internal/auth/kimi/kimi.go
 index ccb1a6c2..5faf3f19 100644
@@ -108,10 +105,35 @@ index 28706795..a0ba5dd4 100644
  
  // GetAntigravityModels returns the standard Antigravity model definitions.
 diff --git a/internal/runtime/executor/kimi_executor.go b/internal/runtime/executor/kimi_executor.go
-index 931e3a56..f70c9c78 100644
+index 931e3a56..14ec25ec 100644
 --- a/internal/runtime/executor/kimi_executor.go
 +++ b/internal/runtime/executor/kimi_executor.go
-@@ -494,18 +494,26 @@ func (e *KimiExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
+@@ -4,6 +4,8 @@ import (
+ 	"bufio"
+ 	"bytes"
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -113,6 +115,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
+ 	if err != nil {
+ 		return resp, err
+ 	}
++	body = applyKimiPromptCacheKey(body, upstreamModel, auth)
+ 
+ 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
+ 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+@@ -222,6 +225,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	body = applyKimiPromptCacheKey(body, upstreamModel, auth)
+ 
+ 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
+ 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+@@ -494,18 +498,26 @@ func (e *KimiExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
  	return auth, nil
  }
  
@@ -140,7 +162,7 @@ index 931e3a56..f70c9c78 100644
  	if stream {
  		r.Header.Set("Accept", "text/event-stream")
  		return
-@@ -513,6 +521,13 @@ func applyKimiHeaders(r *http.Request, token string, stream bool) {
+@@ -513,6 +525,13 @@ func applyKimiHeaders(r *http.Request, token string, stream bool) {
  	r.Header.Set("Accept", "application/json")
  }
  
@@ -154,7 +176,7 @@ index 931e3a56..f70c9c78 100644
  func resolveKimiDeviceIDFromAuth(auth *cliproxyauth.Auth) string {
  	if auth == nil || auth.Metadata == nil {
  		return ""
-@@ -624,10 +639,26 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
+@@ -624,10 +643,82 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
  	return ""
  }
  
@@ -167,6 +189,62 @@ index 931e3a56..f70c9c78 100644
 +// generation.
 +var kimiPreservedModels = map[string]struct{}{
 +	"kimi-for-coding": {},
++}
++
++// applyKimiPromptCacheKey attaches a deterministic prompt_cache_key to the
++// outgoing request body for the K2.6 coding model. Mirrors kimi-cli behaviour
++// (llm.py: gen_kwargs["prompt_cache_key"] = session_id) so the Kimi backend
++// can reuse its KV cache across turns of the same conversation.
++//
++// Scope: intentionally limited to upstreamModel == "kimi-for-coding" so that
++// behaviour of other Kimi variants (kimi-k2, kimi-k2-thinking, kimi-k2.5, ...)
++// and other providers is completely unchanged.
++//
++// Key derivation: sha256 of (authID || system prompt || first user message).
++// This is stable across turns in a conversation (system + opening user turn
++// rarely change) while still varying per auth account and per conversation,
++// so cache lookups hit but different sessions do not collide. If the body
++// already carries a prompt_cache_key (client-provided), that value wins.
++func applyKimiPromptCacheKey(body []byte, upstreamModel string, auth *cliproxyauth.Auth) []byte {
++	if !strings.EqualFold(strings.TrimSpace(upstreamModel), "kimi-for-coding") {
++		return body
++	}
++	if existing := gjson.GetBytes(body, "prompt_cache_key"); existing.Exists() && strings.TrimSpace(existing.String()) != "" {
++		return body
++	}
++	h := sha256.New()
++	if auth != nil {
++		h.Write([]byte(auth.ID))
++		h.Write([]byte{0})
++	}
++	sys := gjson.GetBytes(body, "system")
++	if sys.Exists() {
++		h.Write([]byte(sys.Raw))
++		h.Write([]byte{0})
++	}
++	msgs := gjson.GetBytes(body, "messages")
++	if msgs.IsArray() {
++		msgs.ForEach(func(_, m gjson.Result) bool {
++			if strings.EqualFold(m.Get("role").String(), "system") {
++				h.Write([]byte(m.Get("content").Raw))
++				h.Write([]byte{0})
++			}
++			return true
++		})
++		msgs.ForEach(func(_, m gjson.Result) bool {
++			if strings.EqualFold(m.Get("role").String(), "user") {
++				h.Write([]byte(m.Get("content").Raw))
++				return false
++			}
++			return true
++		})
++	}
++	key := hex.EncodeToString(h.Sum(nil))[:32]
++	updated, err := sjson.SetBytes(body, "prompt_cache_key", key)
++	if err != nil {
++		return body
++	}
++	return updated
 +}
 +
 +// stripKimiPrefix removes the "kimi-" prefix from model names for the upstream
