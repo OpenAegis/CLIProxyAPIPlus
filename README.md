@@ -11,7 +11,7 @@ The current fork-specific stack is intentionally small: ten numbered patches gro
 ## What Is Different In This Fork
 
 - Custom behavior lives in [`patches/`](patches/), not as long-lived source edits.
-- The Docker build applies patch files in lexical order during `docker build`.
+- The Docker build applies patch files in lexical order during `docker build` and fails fast if one goes stale.
 - The goal is to stay mergeable with upstream while keeping the fork-specific behavior isolated.
 
 If you change Go source directly and commit that source change instead of updating the matching patch file, the next upstream sync will overwrite your work. For fork maintenance, treat the patch files as the real source of truth.
@@ -20,7 +20,7 @@ If you change Go source directly and commit that source change instead of updati
 
 1. The repo tracks upstream normally.
 2. Fork changes live as numbered patch files in [`patches/`](patches/).
-3. [`Dockerfile`](Dockerfile) copies the repo, then applies `patches/*.patch` in sorted order.
+3. [`Dockerfile`](Dockerfile) copies the repo, then applies `patches/*.patch` in sorted order and fails the build if any patch is stale.
 4. The patched tree is compiled into the final `CLIProxyAPIPlus` binary.
 
 That means the important workflow is:
@@ -43,14 +43,14 @@ git checkout -- internal/ sdk/
 | Patch | Purpose |
 |---|---|
 | `001-unlimited-copilot-headers.patch` | Spoofs Copilot/VS Code headers and sets the Copilot header baseline used by the fork. |
-| `002-copilot-claude-endpoint.patch` | Routes Claude models to Copilot's `/v1/messages`, uses `/responses` for GPT-5.3/Codex-style models, strips the `copilot-` prefix, and improves Copilot Claude streaming/thinking behavior. |
+| `002-copilot-claude-endpoint.patch` | Keeps Copilot alias handling working after upstream Claude routing landed by stripping the `copilot-` prefix inside executor endpoint selection, native gateway detection, token counting, and model normalization. |
 | `003-antigravity-claude-thinking-signature-fix.patch` | Fixes Claude thinking signature handling for Antigravity translators. |
 | `004-antigravity-assistant-prefill-fix.patch` | Rewrites Claude-model assistant prefill only in the Antigravity Gemini translator path. |
 | `005-antigravity-merge-consecutive-turns.patch` | Merges consecutive same-role turns for Antigravity backends. |
 | `006-antigravity-anti-fingerprinting.patch` | Adds per-account Antigravity fingerprinting on top of upstream version updates. |
 | `007-copilot-responses-vision-detection.patch` | Extends Copilot vision detection to Responses API `input[]` image items. |
 | `008-streaming-tool-call-deltas.patch` | Streams Claude tool call argument deltas incrementally in the Claude-to-OpenAI translator. |
-| `009-copilot-anti-fingerprinting.patch` | Adds per-account Copilot header diversity, persistent MachineId/SessionId behavior, conversation-aware warm-session billing, compaction-stable warm keys, and cold-session startup reservation. |
+| `009-copilot-anti-fingerprinting.patch` | Adds deterministic per-account Copilot header fingerprints, persistent MachineId/SessionId behavior, warm-conversation tracking across restarts, and conversation-aware `X-Initiator` control for native Claude traffic. |
 | `010-kimi-k26-support.patch` | Kimi K2.6 (`kimi-for-coding`) support: updated `kimi_cli/1.35.0` headers (UA, `X-Msh-Version`, `X-Msh-Os-Version`) in both chat traffic and OAuth device-flow, whitelists `kimi-for-coding` in prefix stripping, emits `thinking.type="enabled"` alongside `reasoning_effort`, attaches a deterministic `prompt_cache_key` for `kimi-for-coding` only, and registers a static `kimi-for-coding` model entry. Scoped entirely to the Kimi provider. |
 
 ## Patch Layout

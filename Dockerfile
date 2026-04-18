@@ -12,21 +12,20 @@ RUN go mod download
 COPY . .
 
 # Apply patches in order (001, 002, 003, etc.)
-# Patches are applied after sync with upstream to add custom features
+# Patches are applied after sync with upstream to add custom features.
+# Fail the build immediately if any patch no longer applies cleanly.
 RUN echo "=== Applying custom patches ===" && \
-    if [ -d patches ] && [ "$(ls -A patches/*.patch 2>/dev/null)" ]; then \
-        git init 2>/dev/null || true; \
-        git config user.email "build@local" 2>/dev/null || true; \
-        git config user.name "Build" 2>/dev/null || true; \
-        git add -A 2>/dev/null || true; \
-        git commit -m "pre-patch" 2>/dev/null || true; \
-        for patch in $(ls patches/*.patch 2>/dev/null | sort); do \
+    if [ -d patches ] && ls patches/*.patch >/dev/null 2>&1; then \
+        git init >/dev/null 2>&1 || true; \
+        git config user.email "build@local" >/dev/null 2>&1 || true; \
+        git config user.name "Build" >/dev/null 2>&1 || true; \
+        git add -A >/dev/null 2>&1 || true; \
+        git commit -m "pre-patch" >/dev/null 2>&1 || true; \
+        for patch in $(ls patches/*.patch | sort); do \
             echo "Applying: $patch"; \
-            if git apply --check "$patch" 2>/dev/null; then \
-                git apply "$patch" && echo "  SUCCESS: $patch"; \
-            else \
-                echo "  SKIP: $patch (may already be applied or conflicts)"; \
-            fi; \
+            git apply --check "$patch"; \
+            git apply "$patch"; \
+            echo "  SUCCESS: $patch"; \
         done; \
     else \
         echo "No patches to apply"; \

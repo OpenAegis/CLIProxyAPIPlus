@@ -1,19 +1,15 @@
 # PATCH 006: Antigravity anti-fingerprinting on top of upstream version updates
 #
-# Builds on upstreams Antigravity release updater instead of shadowing it locally.
-# Keeps the fork-specific fingerprinting improvements that upstream still lacks:
-#
-# 1. Session ID: salt with auth ID and emit the structured real-traffic shape
-#    (-{uuid}:{model}:{project}:seed-{hex16}) to reduce cross-account correlation.
-# 2. User-Agent: keep the upstream version source, but choose a deterministic
-#    per-account platform fingerprint and prevent version downgrades per account.
-# 3. Project ID: expand the adjective/noun pools for more realistic random names.
-
+# Keeps the fork-specific Antigravity fingerprinting behavior that upstream still
+# lacks:
+# - deterministic per-account platform fingerprints without version downgrade
+# - structured session IDs salted by auth/model/project
+# - broader random project-name pools
+# - targeted tests for the fingerprint helpers
 diff --git a/internal/runtime/executor/antigravity_executor.go b/internal/runtime/executor/antigravity_executor.go
-index 4796fa9a..ded2f9de 100644
 --- a/internal/runtime/executor/antigravity_executor.go
 +++ b/internal/runtime/executor/antigravity_executor.go
-@@ -10,6 +10,7 @@ import (
+@@ -10,6 +10,7 @@
  	"crypto/sha256"
  	"crypto/tls"
  	"encoding/binary"
@@ -21,7 +17,7 @@ index 4796fa9a..ded2f9de 100644
  	"encoding/json"
  	"errors"
  	"fmt"
-@@ -87,8 +88,15 @@ type antigravity429Decision struct {
+@@ -88,8 +89,13 @@
  }
  
  var (
@@ -30,24 +26,20 @@ index 4796fa9a..ded2f9de 100644
 +	randSource      = rand.New(rand.NewSource(time.Now().UnixNano()))
 +	randSourceMutex sync.Mutex
 +
-+	// Per-account last-used version to prevent version downgrades
 +	antigravityAccountVersions   = make(map[string]string)
 +	antigravityAccountVersionsMu sync.RWMutex
-+
-+	antigravityUAPlatforms = []string{"win32/x64", "darwin/arm64", "linux/x64", "linux/arm64"}
++	antigravityUAPlatforms       = []string{"win32/x64", "darwin/arm64", "linux/x64", "linux/arm64"}
 +
  	antigravityCreditsFailureByAuth   sync.Map
  	antigravityPreferCreditsByModel   sync.Map
  	antigravityShortCooldownByAuth    sync.Map
-@@ -112,6 +120,29 @@ var (
+@@ -113,6 +119,27 @@
  	}
  )
  
-+// compareVersions compares two semver-style version strings (e.g. "1.18.3").
-+// Returns -1 if a < b, 0 if a == b, 1 if a > b.
 +func compareVersions(a, b string) int {
-+	partsA := strings.SplitN(a, ".", 3)
-+	partsB := strings.SplitN(b, ".", 3)
++	partsA := strings.SplitN(strings.TrimSpace(a), ".", 3)
++	partsB := strings.SplitN(strings.TrimSpace(b), ".", 3)
 +	for i := 0; i < 3; i++ {
 +		var na, nb int
 +		if i < len(partsA) {
@@ -56,10 +48,10 @@ index 4796fa9a..ded2f9de 100644
 +		if i < len(partsB) {
 +			nb, _ = strconv.Atoi(partsB[i])
 +		}
-+		if na < nb {
++		switch {
++		case na < nb:
 +			return -1
-+		}
-+		if na > nb {
++		case na > nb:
 +			return 1
 +		}
 +	}
@@ -69,20 +61,21 @@ index 4796fa9a..ded2f9de 100644
  // AntigravityExecutor proxies requests to the antigravity upstream.
  type AntigravityExecutor struct {
  	cfg *config.Config
-@@ -1942,7 +1973,11 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+@@ -1953,7 +1980,12 @@
  			projectID = strings.TrimSpace(pid)
  		}
  	}
 -	payload = geminiToAntigravity(modelName, payload, projectID)
-+	var authID string
++
++	authID := ""
 +	if auth != nil {
-+		authID = auth.ID
++		authID = strings.TrimSpace(auth.ID)
 +	}
 +	payload = geminiToAntigravity(modelName, payload, projectID, authID)
  	payload, _ = sjson.SetBytes(payload, "model", modelName)
  
- 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
-@@ -1996,9 +2031,8 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+ 	// Cap maxOutputTokens to model's max_completion_tokens from registry
+@@ -2038,9 +2070,8 @@
  	}
  	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
  
@@ -93,7 +86,7 @@ index 4796fa9a..ded2f9de 100644
  		authLabel = auth.Label
  		authType, authValue = auth.AccountInfo()
  	}
-@@ -2109,6 +2143,26 @@ func resolveUserAgent(auth *cliproxyauth.Auth) string {
+@@ -2160,6 +2191,24 @@
  				return strings.TrimSpace(ua)
  			}
  		}
@@ -102,25 +95,23 @@ index 4796fa9a..ded2f9de 100644
 +			if version == "" {
 +				return misc.AntigravityUserAgent()
 +			}
-+			// Prevent version downgrades: never use a version older than the last
-+			// version emitted for this account, even if the shared updater falls back.
 +			antigravityAccountVersionsMu.RLock()
-+			lastVer := antigravityAccountVersions[authID]
++			lastVersion := antigravityAccountVersions[authID]
 +			antigravityAccountVersionsMu.RUnlock()
-+			if lastVer != "" && compareVersions(version, lastVer) < 0 {
-+				version = lastVer
++			if lastVersion != "" && compareVersions(version, lastVersion) < 0 {
++				version = lastVersion
 +			}
 +			antigravityAccountVersionsMu.Lock()
 +			antigravityAccountVersions[authID] = version
 +			antigravityAccountVersionsMu.Unlock()
-+			h := sha256.Sum256([]byte(authID + "ua-salt"))
-+			pIdx := int(binary.BigEndian.Uint32(h[4:8])) % len(antigravityUAPlatforms)
-+			return fmt.Sprintf("antigravity/%s %s", version, antigravityUAPlatforms[pIdx])
++			hash := sha256.Sum256([]byte(authID + ":antigravity-platform"))
++			platformIdx := int(binary.BigEndian.Uint32(hash[4:8]) % uint32(len(antigravityUAPlatforms)))
++			return fmt.Sprintf("antigravity/%s %s", version, antigravityUAPlatforms[platformIdx])
 +		}
  	}
  	return misc.AntigravityUserAgent()
  }
-@@ -2296,7 +2350,7 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
+@@ -2347,7 +2396,7 @@
  	return ""
  }
  
@@ -129,7 +120,7 @@ index 4796fa9a..ded2f9de 100644
  	template := payload
  	template, _ = sjson.SetBytes(template, "model", modelName)
  	template, _ = sjson.SetBytes(template, "userAgent", "antigravity")
-@@ -2315,14 +2369,15 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
+@@ -2366,14 +2415,15 @@
  	if projectID != "" {
  		template, _ = sjson.SetBytes(template, "project", projectID)
  	} else {
@@ -147,7 +138,7 @@ index 4796fa9a..ded2f9de 100644
  	}
  
  	template, _ = sjson.DeleteBytes(template, "request.safetySettings")
-@@ -2348,26 +2403,59 @@ func generateSessionID() string {
+@@ -2399,26 +2449,59 @@
  	return "-" + strconv.FormatInt(n, 10)
  }
  
@@ -170,17 +161,17 @@ index 4796fa9a..ded2f9de 100644
  		}
  	}
 -	return generateSessionID()
-+
-+	// Generate stable UUID from auth ID + first user text
-+	h := sha256.Sum256([]byte(authID + ":" + firstUserText))
++	stableKey := strings.TrimSpace(authID) + ":" + firstUserText
++	if stableKey == ":" {
++		return generateSessionID()
++	}
++	hash := sha256.Sum256([]byte(stableKey))
 +	uuidBytes := make([]byte, 16)
-+	copy(uuidBytes, h[:16])
-+	// Set UUID v4 variant bits
++	copy(uuidBytes, hash[:16])
 +	uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x40
 +	uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80
 +	stableUUID := fmt.Sprintf("%x-%x-%x-%x-%x", uuidBytes[0:4], uuidBytes[4:6], uuidBytes[6:8], uuidBytes[8:10], uuidBytes[10:16])
 +
-+	// Generate random seed hex
 +	randSourceMutex.Lock()
 +	seedBytes := make([]byte, 8)
 +	for i := range seedBytes {
@@ -205,7 +196,7 @@ index 4796fa9a..ded2f9de 100644
 +	}
 +	nouns := []string{
 +		"memento", "sunup", "reef", "zucchini", "cubist",
-+		"zepplin", "fuze", "wave", "spark", "flow",
++		"zeppelin", "fuze", "wave", "spark", "flow",
 +		"prism", "grove", "delta", "ridge", "bloom",
 +		"crest", "haven", "nexus", "orbit", "pulse",
 +		"quartz", "shard", "thorn", "vault", "whirl",
@@ -214,3 +205,84 @@ index 4796fa9a..ded2f9de 100644
  	randSourceMutex.Lock()
  	adj := adjectives[randSource.Intn(len(adjectives))]
  	noun := nouns[randSource.Intn(len(nouns))]
+diff --git a/internal/runtime/executor/antigravity_executor_fingerprint_test.go b/internal/runtime/executor/antigravity_executor_fingerprint_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/antigravity_executor_fingerprint_test.go
+@@ -0,0 +1,76 @@
++package executor
++
++import (
++	"strings"
++	"testing"
++
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
++	"github.com/tidwall/gjson"
++)
++
++func resetAntigravityAccountVersionsForTest() {
++	antigravityAccountVersionsMu.Lock()
++	defer antigravityAccountVersionsMu.Unlock()
++	antigravityAccountVersions = make(map[string]string)
++}
++
++func TestResolveUserAgent_UsesPerAccountFingerprintWithoutDowngrade(t *testing.T) {
++	resetAntigravityAccountVersionsForTest()
++
++	antigravityAccountVersionsMu.Lock()
++	antigravityAccountVersions["acct-1"] = "9.9.9"
++	antigravityAccountVersionsMu.Unlock()
++
++	auth := &cliproxyauth.Auth{ID: "acct-1"}
++	got1 := resolveUserAgent(auth)
++	got2 := resolveUserAgent(auth)
++
++	if got1 != got2 {
++		t.Fatalf("resolveUserAgent() should be stable per account, got %q then %q", got1, got2)
++	}
++	if !strings.HasPrefix(got1, "antigravity/9.9.9 ") {
++		t.Fatalf("resolveUserAgent() = %q, want version prefix %q", got1, "antigravity/9.9.9 ")
++	}
++}
++
++func TestGenerateStableSessionID_UsesStructuredStablePrefix(t *testing.T) {
++	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
++
++	got1 := generateStableSessionID(payload, "acct-1", "claude-opus-4-6", "quiet-reef-12345")
++	got2 := generateStableSessionID(payload, "acct-1", "claude-opus-4-6", "quiet-reef-12345")
++
++	prefix1, _, ok1 := strings.Cut(got1, ":seed-")
++	prefix2, _, ok2 := strings.Cut(got2, ":seed-")
++	if !ok1 || !ok2 {
++		t.Fatalf("session IDs should contain seed suffix, got %q and %q", got1, got2)
++	}
++	if prefix1 != prefix2 {
++		t.Fatalf("stable session prefix mismatch: %q vs %q", prefix1, prefix2)
++	}
++	if !strings.Contains(got1, ":claude-opus-4-6:quiet-reef-12345:seed-") {
++		t.Fatalf("session ID should embed model and project, got %q", got1)
++	}
++}
++
++func TestGenerateStableSessionID_FallsBackWithoutStableInputs(t *testing.T) {
++	got := generateStableSessionID([]byte(`{"request":{"contents":[]}}`), "", "", "")
++	if !strings.HasPrefix(got, "-") {
++		t.Fatalf("fallback session ID should start with '-', got %q", got)
++	}
++	if strings.Contains(got, ":seed-") {
++		t.Fatalf("fallback session ID should not use structured seed form, got %q", got)
++	}
++}
++
++func TestGeminiToAntigravity_InjectsStructuredSessionID(t *testing.T) {
++	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
++	out := geminiToAntigravity("claude-opus-4-6", payload, "quiet-reef-12345", "acct-1")
++
++	if got := gjson.GetBytes(out, "project").String(); got != "quiet-reef-12345" {
++		t.Fatalf("project = %q, want %q", got, "quiet-reef-12345")
++	}
++	sessionID := gjson.GetBytes(out, "request.sessionId").String()
++	if !strings.Contains(sessionID, ":claude-opus-4-6:quiet-reef-12345:seed-") {
++		t.Fatalf("session ID = %q, want structured fingerprint format", sessionID)
++	}
++}
