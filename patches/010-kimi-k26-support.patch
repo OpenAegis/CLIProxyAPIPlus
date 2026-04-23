@@ -59,11 +59,11 @@ index ccb1a6c2..5faf3f19 100644
  		"X-Msh-Device-Model": getDeviceModel(),
  		"X-Msh-Device-Id":    c.deviceID,
 diff --git a/internal/registry/model_definitions.go b/internal/registry/model_definitions.go
-index 28706795..a0ba5dd4 100644
+index 17ad39d7..c05145e6 100644
 --- a/internal/registry/model_definitions.go
 +++ b/internal/registry/model_definitions.go
-@@ -66,9 +66,39 @@ func GetCodexProModels() []*ModelInfo {
- 	return cloneModelInfos(getModels().CodexPro)
+@@ -68,9 +68,39 @@ func GetCodexProModels() []*ModelInfo {
+ 	return WithCodexBuiltins(cloneModelInfos(getModels().CodexPro))
  }
  
 -// GetKimiModels returns the standard Kimi (Moonshot AI) model definitions.

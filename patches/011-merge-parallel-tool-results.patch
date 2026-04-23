@@ -1,0 +1,190 @@
+# PATCH 011: Merge parallel tool results into single Claude messages
+#
+# Fixes a Claude API validation error that occurs when AI coding agents
+# (e.g. OpenCode, Junie) make parallel tool calls:
+#
+#   "messages.N: `tool_use` ids were found without `tool_result` blocks
+#    immediately after: toolu_XXX. Each `tool_use` block must have a
+#    corresponding `tool_result` block in the next message."
+#
+# Root cause: both the Chat Completions and Responses API translators
+# created a separate user message for each tool result. When an assistant
+# turn contains multiple parallel tool_use blocks, Claude requires ALL
+# corresponding tool_result blocks in a single user message immediately
+# after. The old code split them across multiple user messages, so only
+# the first tool_result was in the "immediately after" position.
+#
+# Changes:
+#   - claude_openai_request.go (Chat Completions translator):
+#       * Consecutive "tool" role messages are merged into one user
+#         message with multiple tool_result content blocks
+#   - claude_openai-responses_request.go (Responses API translator):
+#       * Consecutive function_call items are merged into one assistant
+#         message with multiple tool_use content blocks
+#       * Consecutive function_call_output items are merged into one
+#         user message with multiple tool_result content blocks
+#
+diff --git a/internal/translator/claude/openai/chat-completions/claude_openai_request.go b/internal/translator/claude/openai/chat-completions/claude_openai_request.go
+index e9d8d35b..7c47b22c 100644
+--- a/internal/translator/claude/openai/chat-completions/claude_openai_request.go
++++ b/internal/translator/claude/openai/chat-completions/claude_openai_request.go
+@@ -244,22 +244,44 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream
+ 				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+ 				messageIndex++
+ 
+-			case "tool":
+-				// Handle tool result messages conversion
+-				toolCallID := message.Get("tool_call_id").String()
+-				toolContentResult := message.Get("content")
+-
+-				msg := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":""}]}`)
+-				msg, _ = sjson.SetBytes(msg, "content.0.tool_use_id", toolCallID)
+-				toolResultContent, toolResultContentRaw := convertOpenAIToolResultContent(toolContentResult)
+-				if toolResultContentRaw {
+-					msg, _ = sjson.SetRawBytes(msg, "content.0.content", []byte(toolResultContent))
+-				} else {
+-					msg, _ = sjson.SetBytes(msg, "content.0.content", toolResultContent)
++		case "tool":
++			// Handle tool result messages conversion.
++			// Consecutive tool results are merged into a single user message
++			// so that all tool_result blocks for a parallel tool_use turn
++			// appear together, as required by the Claude API.
++			toolCallID := message.Get("tool_call_id").String()
++			toolContentResult := message.Get("content")
++
++			toolResultBlock := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
++			toolResultBlock, _ = sjson.SetBytes(toolResultBlock, "tool_use_id", toolCallID)
++			toolResultContent, toolResultContentRaw := convertOpenAIToolResultContent(toolContentResult)
++			if toolResultContentRaw {
++				toolResultBlock, _ = sjson.SetRawBytes(toolResultBlock, "content", []byte(toolResultContent))
++			} else {
++				toolResultBlock, _ = sjson.SetBytes(toolResultBlock, "content", toolResultContent)
++			}
++
++			// Merge into previous user message if it already contains tool_result blocks.
++			msgs := gjson.GetBytes(out, "messages")
++			lastIdx := len(msgs.Array()) - 1
++			merged := false
++			if lastIdx >= 0 {
++				lastMsg := msgs.Array()[lastIdx]
++				if lastMsg.Get("role").String() == "user" && lastMsg.Get("content").IsArray() {
++					if lastMsg.Get("content.0.type").String() == "tool_result" {
++						path := fmt.Sprintf("messages.%d.content.-1", lastIdx)
++						out, _ = sjson.SetRawBytes(out, path, toolResultBlock)
++						merged = true
++					}
+ 				}
++			}
++			if !merged {
++				msg := []byte(`{"role":"user","content":[]}`)
++				msg, _ = sjson.SetRawBytes(msg, "content.-1", toolResultBlock)
+ 				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+ 				messageIndex++
+ 			}
++			}
+ 			return true
+ 		})
+ 
+diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_request.go b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
+index 514129ca..ffbb2ce3 100644
+--- a/internal/translator/claude/openai/responses/claude_openai-responses_request.go
++++ b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
+@@ -300,41 +300,76 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+ 					out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+ 				}
+ 
+-			case "function_call":
+-				// Map to assistant tool_use
+-				callID := item.Get("call_id").String()
+-				if callID == "" {
+-					callID = genToolCallID()
++		case "function_call":
++			// Map to assistant tool_use.
++			// Consecutive function_calls are merged into a single assistant
++			// message so that parallel tool calls share one turn.
++			callID := item.Get("call_id").String()
++			if callID == "" {
++				callID = genToolCallID()
++			}
++			name := item.Get("name").String()
++			argsStr := item.Get("arguments").String()
++
++			toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
++			toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
++			toolUse, _ = sjson.SetBytes(toolUse, "name", name)
++			if argsStr != "" && gjson.Valid(argsStr) {
++				argsJSON := gjson.Parse(argsStr)
++				if argsJSON.IsObject() {
++					toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(argsJSON.Raw))
+ 				}
+-				name := item.Get("name").String()
+-				argsStr := item.Get("arguments").String()
++			}
+ 
+-				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
+-				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
+-				toolUse, _ = sjson.SetBytes(toolUse, "name", name)
+-				if argsStr != "" && gjson.Valid(argsStr) {
+-					argsJSON := gjson.Parse(argsStr)
+-					if argsJSON.IsObject() {
+-						toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(argsJSON.Raw))
++			msgs := gjson.GetBytes(out, "messages")
++			lastIdx := len(msgs.Array()) - 1
++			merged := false
++			if lastIdx >= 0 {
++				lastMsg := msgs.Array()[lastIdx]
++				if lastMsg.Get("role").String() == "assistant" && lastMsg.Get("content").IsArray() {
++					if lastMsg.Get("content.0.type").String() == "tool_use" {
++						path := fmt.Sprintf("messages.%d.content.-1", lastIdx)
++						out, _ = sjson.SetRawBytes(out, path, toolUse)
++						merged = true
+ 					}
+ 				}
+-
++			}
++			if !merged {
+ 				asst := []byte(`{"role":"assistant","content":[]}`)
+ 				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
+ 				out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
++			}
+ 
+-			case "function_call_output":
+-				// Map to user tool_result
+-				callID := item.Get("call_id").String()
+-				outputStr := item.Get("output").String()
+-				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
+-				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
+-				toolResult, _ = sjson.SetBytes(toolResult, "content", outputStr)
++		case "function_call_output":
++			// Map to user tool_result.
++			// Consecutive tool results are merged into a single user message
++			// so that all tool_result blocks for a parallel tool_use turn
++			// appear together, as required by the Claude API.
++			callID := item.Get("call_id").String()
++			outputStr := item.Get("output").String()
++			toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
++			toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
++			toolResult, _ = sjson.SetBytes(toolResult, "content", outputStr)
+ 
++			msgs := gjson.GetBytes(out, "messages")
++			lastIdx := len(msgs.Array()) - 1
++			merged := false
++			if lastIdx >= 0 {
++				lastMsg := msgs.Array()[lastIdx]
++				if lastMsg.Get("role").String() == "user" && lastMsg.Get("content").IsArray() {
++					if lastMsg.Get("content.0.type").String() == "tool_result" {
++						path := fmt.Sprintf("messages.%d.content.-1", lastIdx)
++						out, _ = sjson.SetRawBytes(out, path, toolResult)
++						merged = true
++					}
++				}
++			}
++			if !merged {
+ 				usr := []byte(`{"role":"user","content":[]}`)
+ 				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
+ 				out, _ = sjson.SetRawBytes(out, "messages.-1", usr)
+ 			}
++			}
+ 			return true
+ 		})
+ 	}
