@@ -13,6 +13,7 @@ on:
 
 env:
   UPSTREAM_REPO: 'https://github.com/router-for-me/CLIProxyAPI.git'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   sync:
@@ -26,7 +27,7 @@ jobs:
       commit: ${{ steps.sync.outputs.commit }}
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
@@ -52,11 +53,11 @@ jobs:
           UPSTREAM_HEAD=$(git rev-parse upstream/main)
           FORK_BASE=$(git merge-base HEAD upstream/main)
           CURRENT_COMMIT=$(git rev-parse HEAD)
-          
+
           echo "Upstream HEAD: $UPSTREAM_HEAD"
           echo "Fork base: $FORK_BASE"
           echo "Current commit: $CURRENT_COMMIT"
-          
+
           if [ "$UPSTREAM_HEAD" = "$CURRENT_COMMIT" ] && [ "${{ github.event.inputs.force_sync }}" != "true" ]; then
             echo "✓ Already up to date with upstream"
             echo "synced=false" >> $GITHUB_OUTPUT
@@ -65,19 +66,39 @@ jobs:
             echo "synced=false" >> $GITHUB_OUTPUT
           else
             echo "→ Syncing with upstream changes..."
-            if git merge upstream/main --no-edit --allow-unrelated-histories; then
-              echo "✓ Merge successful"
+            # Try normal merge first
+            if git merge upstream/main --no-edit --allow-unrelated-histories 2>/dev/null; then
+              echo "✓ Merge successful (no conflicts)"
               git push origin main --follow-tags
               echo "synced=true" >> $GITHUB_OUTPUT
             else
-              echo "✗ Merge conflict detected"
-              git merge --abort
-              echo "synced=false" >> $GITHUB_OUTPUT
-              echo "::warning::Merge conflict with upstream. Manual resolution required."
-              exit 1
+              echo "⚠ Conflict detected — resolving with upstream-favored strategy"
+              git merge --abort 2>/dev/null || true
+
+              # Identify files that exist only in our fork (not in upstream)
+              UPSTREAM_FILES=$(git ls-tree -r --name-only upstream/main)
+              OUR_NEW_FILES=$(git diff --name-only HEAD $(git merge-base HEAD upstream/main) | while read f; do
+                echo "$UPSTREAM_FILES" | grep -qx "$f" || echo "$f"
+              done)
+
+              # Reset to upstream/main, then restore our fork-only files
+              git checkout upstream/main -- .
+              if [ -n "$OUR_NEW_FILES" ]; then
+                echo "→ Restoring fork-only files:"
+                echo "$OUR_NEW_FILES" | while read f; do
+                  echo "  + $f"
+                  git checkout HEAD -- "$f" 2>/dev/null || true
+                done
+              fi
+
+              git add -A
+              git commit -m "chore: sync upstream (conflict resolved, upstream-favored)" || echo "Nothing to commit"
+              git push origin main --follow-tags
+              echo "synced=true" >> $GITHUB_OUTPUT
+              echo "::warning::Conflicts were auto-resolved by preferring upstream changes. Fork-only files were preserved."
             fi
           fi
-          
+
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
           COMMIT=$(git rev-parse --short HEAD)
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
