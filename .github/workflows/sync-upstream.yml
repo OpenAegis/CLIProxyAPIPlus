@@ -1,0 +1,105 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if already up to date'
+        required: false
+        default: 'false'
+
+env:
+  UPSTREAM_REPO: 'https://github.com/router-for-me/CLIProxyAPI.git'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      version: ${{ steps.sync.outputs.version }}
+      commit: ${{ steps.sync.outputs.commit }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream ${{ env.UPSTREAM_REPO }} 2>/dev/null || git remote set-url upstream ${{ env.UPSTREAM_REPO }}
+          git remote -v
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream main --tags
+          git fetch upstream --prune
+
+      - name: Check and sync upstream
+        id: sync
+        run: |
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          FORK_BASE=$(git merge-base HEAD upstream/main)
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          
+          echo "Upstream HEAD: $UPSTREAM_HEAD"
+          echo "Fork base: $FORK_BASE"
+          echo "Current commit: $CURRENT_COMMIT"
+          
+          if [ "$UPSTREAM_HEAD" = "$CURRENT_COMMIT" ] && [ "${{ github.event.inputs.force_sync }}" != "true" ]; then
+            echo "✓ Already up to date with upstream"
+            echo "synced=false" >> $GITHUB_OUTPUT
+          elif [ "$UPSTREAM_HEAD" = "$FORK_BASE" ] && [ "${{ github.event.inputs.force_sync }}" != "true" ]; then
+            echo "✓ Already up to date with upstream (fork_base check)"
+            echo "synced=false" >> $GITHUB_OUTPUT
+          else
+            echo "→ Syncing with upstream changes..."
+            if git merge upstream/main --no-edit --allow-unrelated-histories; then
+              echo "✓ Merge successful"
+              git push origin main --follow-tags
+              echo "synced=true" >> $GITHUB_OUTPUT
+            else
+              echo "✗ Merge conflict detected"
+              git merge --abort
+              echo "synced=false" >> $GITHUB_OUTPUT
+              echo "::warning::Merge conflict with upstream. Manual resolution required."
+              exit 1
+            fi
+          fi
+          
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+
+      - name: Create sync report
+        if: always()
+        run: |
+          echo "# Upstream Sync Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Sync Status**: ${{ steps.sync.outputs.synced == 'true' && '✓ Synced' || '- No changes' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: \`${{ steps.sync.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ steps.sync.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: sync
+    if: needs.sync.outputs.synced == 'true'
+    steps:
+      - name: Sync notification
+        run: |
+          echo "✓ Upstream sync completed successfully"
+          echo "  Version: ${{ needs.sync.outputs.version }}"
+          echo "  Commit: ${{ needs.sync.outputs.commit }}"
