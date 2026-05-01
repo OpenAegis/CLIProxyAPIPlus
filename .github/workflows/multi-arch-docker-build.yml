@@ -1,0 +1,255 @@
+name: Multi-Arch Docker Build
+
+on:
+  schedule:
+    # Build daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'patches/**'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/multi-arch-docker-build.yml'
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Registry to push to (dockerhub/ghcr)'
+        required: false
+        default: 'dockerhub'
+      push:
+        description: 'Push to registry'
+        required: false
+        default: 'true'
+
+env:
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/cli-proxy-api-plus
+  GHCR_REPO: ghcr.io/${{ github.repository_owner }}/cli-proxy-api-plus
+  REGISTRY: ${{ github.event.inputs.registry || 'dockerhub' }}
+  SHOULD_PUSH: ${{ github.event.inputs.push || 'true' }}
+
+jobs:
+  build-matrix:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            tag_suffix: -amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            tag_suffix: -arm64
+          - platform: linux/arm/v7
+            runner: ubuntu-latest
+            tag_suffix: -armv7
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Refresh models catalog
+        continue-on-error: true
+        run: |
+          mkdir -p internal/registry/models
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json || echo "Warning: Failed to fetch models"
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF_NAME}
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          fi
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        if: env.REGISTRY == 'dockerhub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: env.REGISTRY == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.platform }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: ${{ env.SHOULD_PUSH == 'true' }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          tags: |
+            ${{ env.REGISTRY == 'dockerhub' && env.DOCKERHUB_REPO || env.GHCR_REPO }}:latest${{ matrix.tag_suffix }}
+            ${{ env.REGISTRY == 'dockerhub' && env.DOCKERHUB_REPO || env.GHCR_REPO }}:${{ steps.meta.outputs.version }}${{ matrix.tag_suffix }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export digest
+        if: env.SHOULD_PUSH == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: env.SHOULD_PUSH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.tag_suffix }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  create-manifest:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && needs.build-matrix.result == 'success'
+    needs:
+      - build-matrix
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download all digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF_NAME}
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        if: env.REGISTRY == 'dockerhub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: env.REGISTRY == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifests
+        working-directory: /tmp/digests
+        run: |
+          REPO="${{ env.REGISTRY == 'dockerhub' && env.DOCKERHUB_REPO || env.GHCR_REPO }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          
+          docker buildx imagetools create \
+            --tag "${REPO}:latest" \
+            "${REPO}:latest-amd64" \
+            "${REPO}:latest-arm64" \
+            "${REPO}:latest-armv7"
+          
+          docker buildx imagetools create \
+            --tag "${REPO}:${VERSION}" \
+            "${REPO}:${VERSION}-amd64" \
+            "${REPO}:${VERSION}-arm64" \
+            "${REPO}:${VERSION}-armv7"
+          
+          echo "✓ Multi-arch manifests created successfully"
+
+      - name: Cleanup platform-specific tags (DockerHub only)
+        if: env.REGISTRY == 'dockerhub'
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set +e
+          
+          REPO="${{ env.DOCKERHUB_REPO }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          namespace="${REPO%%/*}"
+          repo_name="${REPO#*/}"
+          
+          # Obtain auth token
+          token="$(curl -fsSL \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            'https://hub.docker.com/v2/users/login/' 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' 2>/dev/null)"
+          
+          if [ -z "$token" ]; then
+            echo "Warning: Could not obtain Docker Hub auth token. Skipping cleanup."
+            exit 0
+          fi
+          
+          delete_tag() {
+            local tag="$1"
+            local url="https://hub.docker.com/v2/repositories/${namespace}/${repo_name}/tags/${tag}/"
+            local http_code
+            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
+              -H "Authorization: JWT ${token}" "${url}" 2>/dev/null || echo "0")"
+            
+            if [ "${http_code}" = "204" ] || [ "${http_code}" = "404" ]; then
+              echo "✓ Removed: ${REPO}:${tag}"
+              return 0
+            else
+              echo "⚠ Failed to remove ${REPO}:${tag} (HTTP ${http_code})"
+              return 0
+            fi
+          }
+          
+          echo "Cleaning up platform-specific tags..."
+          delete_tag "latest-amd64"
+          delete_tag "latest-arm64"
+          delete_tag "latest-armv7"
+          delete_tag "${VERSION}-amd64"
+          delete_tag "${VERSION}-arm64"
+          delete_tag "${VERSION}-armv7"
+
+      - name: Build summary
+        run: |
+          echo "# Multi-Arch Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry**: \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: \`${{ steps.meta.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms**: linux/amd64, linux/arm64, linux/arm/v7" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ✓ Build & Manifest Complete" >> $GITHUB_STEP_SUMMARY
